@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Permissions for wis windows","local":true,"windows":["main","overlay"],"permissions":["core:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-ignore-cursor-events"]}}

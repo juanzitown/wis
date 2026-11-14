@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "wis",
+  "version": "0.1.0",
+  "identifier": "dev.juanzitown.wis",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "wis — what i see",
+        "width": 1040,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 620,
+        "center": true
+      },
+      {
+        "label": "overlay",
+        "title": "wis text area",
+        "url": "index.html?window=overlay",
+        "width": 1280,
+        "height": 960,
+        "fullscreen": true,
+        "visible": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "focusable": false,
+        "skipTaskbar": true,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png"],
+    "targets": "all"
+  }
+}
