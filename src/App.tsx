@@ -2,14 +2,12 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   fallbackSettings,
-  getOverlayMode,
   getRuntimeStatus,
   getSettings,
+  CaptureMode,
   OcrUpdate,
-  OverlayMode,
   RuntimeStatus,
   saveSettings,
-  setOverlayMode,
   startOcr,
   stopOcr,
   WisSettings,
@@ -50,17 +48,15 @@ function NumberField({
 export default function App() {
   const [settings, setSettings] = useState<WisSettings>(fallbackSettings);
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
-  const [overlayMode, setCurrentOverlayMode] = useState<OverlayMode>("hidden");
   const [findings, setFindings] = useState<OcrUpdate[]>([]);
   const [message, setMessage] = useState("Getting the text area ready…");
 
   useEffect(() => {
-    Promise.all([getSettings(), getRuntimeStatus(), getOverlayMode()]).then(
-      ([loadedSettings, loadedStatus, loadedMode]) => {
+    Promise.all([getSettings(), getRuntimeStatus()]).then(
+      ([loadedSettings, loadedStatus]) => {
         setSettings(loadedSettings);
         setStatus(loadedStatus);
-        setCurrentOverlayMode(loadedMode);
-        setMessage("Position the area, then start watching.");
+        setMessage("Choose manual OCR or automatic text-block detection.");
       },
     );
     const settingsSubscription = listen<WisSettings>("settings-changed", (event) => {
@@ -70,16 +66,14 @@ export default function App() {
       setStatus(event.payload);
       if (event.payload.lastError) setMessage(event.payload.lastError);
     });
-    const modeSubscription = listen<OverlayMode>("overlay-mode-changed", (event) => {
-      setCurrentOverlayMode(event.payload);
-    });
     const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
-      setFindings((current) => [event.payload, ...current].slice(0, 12));
+      if (event.payload.mode === "manual") {
+        setFindings((current) => [event.payload, ...current].slice(0, 12));
+      }
     });
     return () => {
       settingsSubscription.then((unlisten) => unlisten());
       statusSubscription.then((unlisten) => unlisten());
-      modeSubscription.then((unlisten) => unlisten());
       ocrSubscription.then((unlisten) => unlisten());
     };
   }, []);
@@ -103,33 +97,18 @@ export default function App() {
     }
   }
 
-  async function changeOverlayMode(mode: OverlayMode) {
-    try {
-      const saved = await saveSettings(settings);
-      setSettings(saved);
-      const activeMode = await setOverlayMode(mode);
-      setCurrentOverlayMode(activeMode);
-      setMessage(
-        activeMode === "edit"
-          ? "Drag the box over the text you want wis to read."
-          : activeMode === "preview"
-            ? "The area is visible but clicks pass through it."
-            : "The area overlay is hidden.",
-      );
-    } catch (error) {
-      setMessage(String(error));
-    }
-  }
-
-  async function beginWatching() {
+  async function beginWatching(mode: CaptureMode) {
     try {
       const saved = await saveSettings(settings);
       setSettings(saved);
       setFindings([]);
-      const next = await startOcr();
+      const next = await startOcr(mode);
       setStatus(next);
-      setCurrentOverlayMode("edit");
-      setMessage("The live overlay is active. Use × there to stop and return.");
+      setMessage(
+        mode === "manual"
+          ? "Manual OCR is active. Drag or resize the area on screen."
+          : "Auto detection is scanning the screen for text blocks.",
+      );
     } catch (error) {
       setMessage(String(error));
     }
@@ -153,7 +132,7 @@ export default function App() {
         <div>
           <p className="wordmark">wis <span>/ what i see</span></p>
           <h1>Watch a piece of your screen.</h1>
-          <p className="lede">Draw one area. Every few moments, wis looks for text and keeps the latest findings here.</p>
+          <p className="lede">Read one area manually, or let wis outline every text block it can find.</p>
         </div>
         <div className={`runtime-badge ${status?.running ? "is-running" : ""}`}>
           <span />
@@ -165,20 +144,11 @@ export default function App() {
         <div className="panel setup-panel">
           <div className="section-heading">
             <div>
-              <p className="kicker">Text area</p>
-              <h2>What should I see?</h2>
+              <p className="kicker">Capture mode</p>
+              <h2>How should I look?</h2>
             </div>
-            <span className="mode">{overlayMode}</span>
+            <span className="mode">{status?.mode ?? "ready"}</span>
           </div>
-
-          <button className="area-preview" type="button" disabled={!isIdle} onClick={() => changeOverlayMode("edit")}>
-            <span className="corner corner-tl" />
-            <span className="corner corner-tr" />
-            <span className="corner corner-bl" />
-            <span className="corner corner-br" />
-            <strong>Edit area on screen</strong>
-            <small>{settings.region.width} × {settings.region.height}px at {settings.region.x}, {settings.region.y}</small>
-          </button>
 
           <div className="field-grid">
             <NumberField label="X" value={settings.region.x} min={0} onChange={(value) => updateRegion("x", value)} />
@@ -190,7 +160,7 @@ export default function App() {
           <div className="interval-row">
             <div>
               <strong>Look every</strong>
-              <small>How often OCR runs while watching</small>
+              <small>How often Manual OCR or Auto detection scans</small>
             </div>
             <div className="interval-input">
               <input
@@ -210,7 +180,8 @@ export default function App() {
           </div>
 
           <div className="button-row">
-            <button className="primary" type="button" disabled={!isIdle} onClick={beginWatching}>Start watching</button>
+            <button className="primary" type="button" disabled={!isIdle} onClick={() => beginWatching("manual")}>Start manual</button>
+            <button className="secondary" type="button" disabled={!isIdle} onClick={() => beginWatching("auto")}>Start auto</button>
             <button className="secondary" type="button" disabled={isIdle} onClick={endWatching}>Stop</button>
             <button className="quiet" type="button" disabled={!isIdle} onClick={save}>Save</button>
           </div>

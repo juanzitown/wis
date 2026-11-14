@@ -12,7 +12,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use leptess::{LepTess, Variable};
 use opencv::{
-    core::{self, Mat, Rect, Scalar, Size, Vector},
+    core::{self, Mat, Point, Rect, Scalar, Size, Vector},
     imgcodecs, imgproc,
     prelude::*,
 };
@@ -31,9 +31,33 @@ struct AppState {
 #[derive(Default)]
 struct CaptureRuntime {
     phase: CapturePhase,
+    mode: Option<CaptureMode>,
     stop: Option<Arc<AtomicBool>>,
     last_error: Option<String>,
     frame_size: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    Manual,
+    Auto,
+}
+
+impl CaptureMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "auto" => Ok(Self::Auto),
+            _ => Err("capture mode must be manual or auto".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -64,13 +88,24 @@ struct RuntimeStatus {
     capture_backend: &'static str,
     running: bool,
     phase: &'static str,
+    mode: Option<&'static str>,
     last_error: Option<String>,
     frame_size: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DetectedBlock {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct OcrUpdate {
+    mode: &'static str,
     text: String,
     confidence: i32,
     preview_image_data_url: Option<String>,
@@ -80,6 +115,7 @@ struct OcrUpdate {
     capture_height: u32,
     logical_width: u32,
     logical_height: u32,
+    detected_blocks: Vec<DetectedBlock>,
     error: Option<String>,
 }
 
@@ -166,6 +202,7 @@ fn runtime_status(state: &AppState) -> Result<RuntimeStatus, String> {
         capture_backend: "XDG ScreenCast portal + PipeWire",
         running: capture.phase == CapturePhase::Running,
         phase: capture.phase.as_str(),
+        mode: capture.mode.map(CaptureMode::as_str),
         last_error: capture.last_error.clone(),
         frame_size: capture.frame_size,
     })
@@ -177,7 +214,12 @@ fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, Strin
 }
 
 #[tauri::command]
-fn start_ocr(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+fn start_ocr(
+    mode: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeStatus, String> {
+    let mode = CaptureMode::parse(&mode)?;
     let stop = Arc::new(AtomicBool::new(false));
     {
         let mut capture = state
@@ -188,6 +230,7 @@ fn start_ocr(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Runtim
             return Err("text recognition is already active".to_owned());
         }
         capture.phase = CapturePhase::Starting;
+        capture.mode = Some(mode);
         capture.stop = Some(stop.clone());
         capture.last_error = None;
         capture.frame_size = None;
@@ -201,7 +244,7 @@ fn start_ocr(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Runtim
     thread::Builder::new()
         .name("wis-ocr".to_owned())
         .spawn(move || {
-            let result = run_ocr(worker_app.clone(), stop);
+            let result = run_capture(worker_app.clone(), stop, mode);
             finish_capture(&worker_app, result.err());
         })
         .map_err(|error| {
@@ -260,12 +303,21 @@ fn show_main_window(app: &tauri::AppHandle, state: &AppState) {
     let _ = app.emit("overlay-mode-changed", "hidden");
 }
 
-fn run_ocr(app: tauri::AppHandle, stop: Arc<AtomicBool>) -> Result<(), String> {
-    let mut tesseract = LepTess::new(None, "eng")
-        .map_err(|error| format!("could not initialize Tesseract English OCR: {error}"))?;
-    tesseract
-        .set_variable(Variable::TesseditPagesegMode, "6")
-        .map_err(|_| "could not configure Tesseract for a text block".to_owned())?;
+fn run_capture(
+    app: tauri::AppHandle,
+    stop: Arc<AtomicBool>,
+    mode: CaptureMode,
+) -> Result<(), String> {
+    let mut tesseract = if mode == CaptureMode::Manual {
+        let mut engine = LepTess::new(None, "eng")
+            .map_err(|error| format!("could not initialize Tesseract English OCR: {error}"))?;
+        engine
+            .set_variable(Variable::TesseditPagesegMode, "6")
+            .map_err(|_| "could not configure Tesseract for a text block".to_owned())?;
+        Some(engine)
+    } else {
+        None
+    };
     let capture = CaptureConfig {
         video: VideoConfig {
             channel_capacity: 2,
@@ -297,16 +349,30 @@ fn run_ocr(app: tauri::AppHandle, stop: Arc<AtomicBool>) -> Result<(), String> {
         last_scan = Instant::now();
         let logical_size = overlay_dimensions(&app).unwrap_or(frame.size);
         let started = Instant::now();
-        let (text, confidence, preview_image_data_url, error) = recognize_region(
-            &mut tesseract,
-            &frame.vframe,
-            frame.size,
-            logical_size,
-            settings.region,
-        );
+        let (text, confidence, preview_image_data_url, detected_blocks, error) = match mode {
+            CaptureMode::Manual => {
+                let (text, confidence, preview, error) = recognize_region(
+                    tesseract
+                        .as_mut()
+                        .expect("manual capture always initializes Tesseract"),
+                    &frame.vframe,
+                    frame.size,
+                    logical_size,
+                    settings.region,
+                );
+                (text, confidence, preview, Vec::new(), error)
+            }
+            CaptureMode::Auto => {
+                match detect_text_blocks(&frame.vframe, frame.size, logical_size) {
+                    Ok(blocks) => (String::new(), 0, None, blocks, None),
+                    Err(error) => (String::new(), 0, None, Vec::new(), Some(error)),
+                }
+            }
+        };
         app.emit(
             "ocr-update",
             OcrUpdate {
+                mode: mode.as_str(),
                 text,
                 confidence,
                 preview_image_data_url,
@@ -319,6 +385,7 @@ fn run_ocr(app: tauri::AppHandle, stop: Arc<AtomicBool>) -> Result<(), String> {
                 capture_height: frame.size.1,
                 logical_width: logical_size.0,
                 logical_height: logical_size.1,
+                detected_blocks,
                 error,
             },
         )
@@ -326,6 +393,133 @@ fn run_ocr(app: tauri::AppHandle, stop: Arc<AtomicBool>) -> Result<(), String> {
     }
     capture.terminate();
     Ok(())
+}
+
+fn detect_text_blocks(
+    frame: &[u8],
+    frame_size: (u32, u32),
+    logical_size: (u32, u32),
+) -> Result<Vec<DetectedBlock>, String> {
+    let (frame_width, frame_height) = frame_size;
+    let (logical_width, logical_height) = logical_size;
+    if frame_width == 0 || frame_height == 0 || logical_width == 0 || logical_height == 0 {
+        return Err("capture and logical dimensions must be non-zero".to_owned());
+    }
+    let expected = frame_width as usize * frame_height as usize * 4;
+    if frame.len() < expected {
+        return Err(format!(
+            "BGRA frame is too short: expected {expected} bytes, received {}",
+            frame.len()
+        ));
+    }
+
+    let source = Mat::from_slice(&frame[..expected]).map_err(|error| error.to_string())?;
+    let source = source
+        .reshape(4, frame_height as i32)
+        .map_err(|error| error.to_string())?;
+    let mut gray = Mat::default();
+    imgproc::cvt_color_def(&source, &mut gray, imgproc::COLOR_BGRA2GRAY)
+        .map_err(|error| error.to_string())?;
+
+    // The morphological gradient reacts to light, dark, and colored glyph
+    // edges. Closing with a wide, short kernel joins nearby characters into
+    // line-like blocks without merging unrelated rows of text.
+    let edge_kernel =
+        imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(3, 3), Point::new(-1, -1))
+            .map_err(|error| error.to_string())?;
+    let mut gradient = Mat::default();
+    imgproc::morphology_ex(
+        &gray,
+        &mut gradient,
+        imgproc::MORPH_GRADIENT,
+        &edge_kernel,
+        Point::new(-1, -1),
+        1,
+        core::BORDER_CONSTANT,
+        Scalar::all(0.0),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut edges = Mat::default();
+    imgproc::threshold(
+        &gradient,
+        &mut edges,
+        0.0,
+        255.0,
+        imgproc::THRESH_BINARY | imgproc::THRESH_OTSU,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let kernel_width = ((frame_width / 120).clamp(9, 31) | 1) as i32;
+    let kernel_height = ((frame_height / 360).clamp(3, 7) | 1) as i32;
+    let line_kernel = imgproc::get_structuring_element(
+        imgproc::MORPH_RECT,
+        Size::new(kernel_width, kernel_height),
+        Point::new(-1, -1),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut connected = Mat::default();
+    imgproc::morphology_ex(
+        &edges,
+        &mut connected,
+        imgproc::MORPH_CLOSE,
+        &line_kernel,
+        Point::new(-1, -1),
+        2,
+        core::BORDER_CONSTANT,
+        Scalar::all(0.0),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut contours: Vector<Vector<Point>> = Vector::new();
+    imgproc::find_contours(
+        &connected,
+        &mut contours,
+        imgproc::RETR_EXTERNAL,
+        imgproc::CHAIN_APPROX_SIMPLE,
+        Point::new(0, 0),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let scale = |value: u32, captured: u32, logical: u32| {
+        ((value as u64 * logical as u64 + captured as u64 / 2) / captured as u64) as u32
+    };
+    let maximum_height = (frame_height / 5).max(48) as i32;
+    let mut blocks = Vec::new();
+    for index in 0..contours.len() {
+        let contour = contours.get(index).map_err(|error| error.to_string())?;
+        let rect = imgproc::bounding_rect(&contour).map_err(|error| error.to_string())?;
+        let area = rect.width.saturating_mul(rect.height);
+        if rect.width < 12
+            || rect.height < 6
+            || rect.height > maximum_height
+            || area < 120
+            || rect.width < rect.height / 2
+        {
+            continue;
+        }
+        // Ignore the overlay's stop button in Auto mode.
+        if rect.x > frame_width.saturating_sub(80) as i32 && rect.y < 80 {
+            continue;
+        }
+
+        let left = rect.x.saturating_sub(3).max(0) as u32;
+        let top = rect.y.saturating_sub(3).max(0) as u32;
+        let right = (rect.x + rect.width + 3).max(0) as u32;
+        let bottom = (rect.y + rect.height + 3).max(0) as u32;
+        let x = scale(left.min(frame_width), frame_width, logical_width);
+        let y = scale(top.min(frame_height), frame_height, logical_height);
+        let scaled_right = scale(right.min(frame_width), frame_width, logical_width);
+        let scaled_bottom = scale(bottom.min(frame_height), frame_height, logical_height);
+        blocks.push(DetectedBlock {
+            x,
+            y,
+            width: scaled_right.saturating_sub(x).max(1),
+            height: scaled_bottom.saturating_sub(y).max(1),
+        });
+    }
+    blocks.sort_by_key(|block| (block.y / 8, block.x));
+    blocks.truncate(128);
+    Ok(blocks)
 }
 
 fn recognize_region(
@@ -511,6 +705,7 @@ fn finish_capture(app: &tauri::AppHandle, error: Option<String>) {
     let state = app.state::<AppState>();
     if let Ok(mut capture) = state.capture.lock() {
         capture.phase = CapturePhase::Idle;
+        capture.mode = None;
         capture.stop = None;
         capture.last_error = error;
     }

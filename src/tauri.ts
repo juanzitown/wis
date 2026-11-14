@@ -13,6 +13,7 @@ export type WisSettings = {
 };
 
 export type OverlayMode = "hidden" | "edit" | "preview";
+export type CaptureMode = "manual" | "auto";
 
 export type RuntimeStatus = {
   platform: string;
@@ -20,11 +21,13 @@ export type RuntimeStatus = {
   captureBackend: string;
   running: boolean;
   phase: "idle" | "starting" | "running" | "stopping";
+  mode: CaptureMode | null;
   lastError: string | null;
   frameSize: [number, number] | null;
 };
 
 export type OcrUpdate = {
+  mode: CaptureMode;
   text: string;
   confidence: number;
   previewImageDataUrl: string | null;
@@ -34,6 +37,7 @@ export type OcrUpdate = {
   captureHeight: number;
   logicalWidth: number;
   logicalHeight: number;
+  detectedBlocks: Region[];
   error: string | null;
 };
 
@@ -64,14 +68,15 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
       captureBackend: "Tauri runtime required",
       running: false,
       phase: "idle",
+      mode: null,
       lastError: null,
       frameSize: null,
     };
   }
 }
 
-export function startOcr() {
-  return invoke<RuntimeStatus>("start_ocr");
+export function startOcr(mode: CaptureMode) {
+  return invoke<RuntimeStatus>("start_ocr", { mode });
 }
 
 export function stopOcr() {

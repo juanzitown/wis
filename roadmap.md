@@ -1,7 +1,11 @@
 Features
 
-- make the latest findings popup to be scrollable
-- detect text lines and text block, shows border preview, auto slice and send to tesseract (each detect block should have its popup preview)
+- [x] make the latest findings popup scrollable
+- [ ] detect text lines and text blocks
+  - [x] add Manual and Auto modes while preserving the single draggable Manual area
+  - [x] show thin Auto-mode borders around detected blocks
+  - [ ] auto-slice detected blocks and send each to Tesseract
+  - [ ] show a popup preview for every detected block
 
 Improvements
 

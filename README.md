@@ -1,10 +1,11 @@
 # wis — what i see
 
-`wis` is a small Linux-first OCR proof of concept. Place one resizable area over any part of the screen, choose how often to scan it, and watch the recognized text appear in a rolling findings feed.
+`wis` is a small Linux-first screen-recognition proof of concept. Use one resizable Manual area for OCR, or let Auto mode outline text blocks across the captured screen.
 
 ## What it does
 
-- Transparent text-area overlay that stays draggable and resizable while OCR runs.
+- Manual mode with one draggable, resizable OCR area and live findings.
+- Auto mode with thin outlines around detected text blocks across the screen.
 - Persistent area coordinates and scan interval.
 - Wayland screen capture through the XDG ScreenCast portal and PipeWire.
 - Periodic OpenCV preprocessing and Tesseract OCR.
@@ -22,7 +23,7 @@ chmod +x setup-bazzite.sh
 yarn dev
 ```
 
-In the app, select **Edit area on screen**, drag and resize the box, and choose **Done**. Then select **Start watching** and grant access to the screen containing the text.
+Choose **Start manual** to position one OCR area and read its contents, or **Start auto** to detect text blocks across the screen. Both modes use the configured **Look every** interval and open the system screen-selection dialog.
 
 ## Architecture
 

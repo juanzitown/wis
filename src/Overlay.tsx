@@ -9,7 +9,6 @@ import {
   Region,
   RuntimeStatus,
   saveSettings,
-  setOverlayMode,
   stopOcr,
   WisSettings,
   fallbackSettings,
@@ -68,7 +67,7 @@ export default function Overlay() {
   }, []);
 
   function startDrag(event: PointerEvent, action: DragAction) {
-    if (mode !== "edit") return;
+    if (mode !== "edit" || (status?.phase !== "idle" && status?.mode !== "manual")) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -110,11 +109,15 @@ export default function Overlay() {
 
   const region = settings.region;
   const isActive = status?.phase !== "idle" && status !== null;
+  const isManualActive = isActive && status?.mode === "manual";
+  const isAutoActive = isActive && status?.mode === "auto";
   const controlsBelow = region.y < 44;
-  const controlStyle: CSSProperties = {
-    left: Math.min(Math.max(8, region.x + region.width - 32), Math.max(8, window.innerWidth - 40)),
-    top: controlsBelow ? region.y + region.height + 8 : region.y - 38,
-  };
+  const controlStyle: CSSProperties = isAutoActive
+    ? { right: 18, top: 18 }
+    : {
+        left: Math.min(Math.max(8, region.x + region.width - 32), Math.max(8, window.innerWidth - 40)),
+        top: controlsBelow ? region.y + region.height + 8 : region.y - 38,
+      };
   const popupWidth = Math.min(400, window.innerWidth - 24);
   const popupHeight = Math.min(360, window.innerHeight - 24);
   const belowTop = region.y + region.height + (controlsBelow ? 52 : 12);
@@ -136,20 +139,29 @@ export default function Overlay() {
       onPointerUp={finishDrag}
       onPointerCancel={finishDrag}
     >
-      <div
-        className="overlay-region"
-        style={{ left: region.x, top: region.y, width: region.width, height: region.height }}
-        onPointerDown={(event) => startDrag(event, "move")}
-      >
-        <span className="overlay-label">Text area</span>
-        {mode === "edit" && (["nw", "ne", "sw", "se"] as DragAction[]).map((action) => (
-          <span
-            className={`resize-handle handle-${action}`}
-            key={action}
-            onPointerDown={(event) => startDrag(event, action)}
-          />
-        ))}
-      </div>
+      {!isAutoActive && (
+        <div
+          className="overlay-region"
+          style={{ left: region.x, top: region.y, width: region.width, height: region.height }}
+          onPointerDown={(event) => startDrag(event, "move")}
+        >
+          <span className="overlay-label">Manual area</span>
+          {mode === "edit" && (["nw", "ne", "sw", "se"] as DragAction[]).map((action) => (
+            <span
+              className={`resize-handle handle-${action}`}
+              key={action}
+              onPointerDown={(event) => startDrag(event, action)}
+            />
+          ))}
+        </div>
+      )}
+      {isAutoActive && finding?.detectedBlocks.map((block, index) => (
+        <div
+          className="auto-detected-block"
+          key={`${index}-${block.x}-${block.y}-${block.width}-${block.height}`}
+          style={{ left: block.x, top: block.y, width: block.width, height: block.height }}
+        />
+      ))}
       {isActive && (
         <button
           aria-label="Stop OCR and return to wis"
@@ -163,8 +175,14 @@ export default function Overlay() {
           ×
         </button>
       )}
-      {isActive && (
-        <div className={`overlay-finding ${finding?.error ? "has-error" : ""}`} style={findingStyle}>
+      {isManualActive && (
+        <div
+          aria-live="polite"
+          className={`overlay-finding ${finding?.error ? "has-error" : ""}`}
+          style={findingStyle}
+          tabIndex={0}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
           <div className="overlay-finding-heading">
             <span>{finding ? "Latest finding" : "Looking…"}</span>
             {finding && !finding.error && <small>{finding.confidence}%</small>}
@@ -178,15 +196,6 @@ export default function Overlay() {
           <p>{finding?.error || finding?.text || (finding ? "No text found" : "Waiting for the first scan")}</p>
           {finding && <small>{finding.elapsedMs}ms · {new Date(finding.observedAtMs).toLocaleTimeString()}</small>}
         </div>
-      )}
-      {mode === "edit" && !isActive && (
-        <>
-          <div className="overlay-help">Move the area · drag a corner to resize</div>
-          <div className="overlay-toolbar" onPointerDown={(event) => event.stopPropagation()}>
-            <button type="button" onClick={() => setOverlayMode("preview")}>Done</button>
-            <button type="button" onClick={() => setOverlayMode("hidden")}>Hide</button>
-          </div>
-        </>
       )}
     </div>
   );
