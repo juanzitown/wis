@@ -70,12 +70,16 @@ export default function App() {
       setStatus(event.payload);
       if (event.payload.lastError) setMessage(event.payload.lastError);
     });
+    const modeSubscription = listen<OverlayMode>("overlay-mode-changed", (event) => {
+      setCurrentOverlayMode(event.payload);
+    });
     const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
       setFindings((current) => [event.payload, ...current].slice(0, 12));
     });
     return () => {
       settingsSubscription.then((unlisten) => unlisten());
       statusSubscription.then((unlisten) => unlisten());
+      modeSubscription.then((unlisten) => unlisten());
       ocrSubscription.then((unlisten) => unlisten());
     };
   }, []);
@@ -121,12 +125,11 @@ export default function App() {
     try {
       const saved = await saveSettings(settings);
       setSettings(saved);
-      await setOverlayMode("hidden");
-      setCurrentOverlayMode("hidden");
       setFindings([]);
       const next = await startOcr();
       setStatus(next);
-      setMessage("Choose the screen containing the text in the system dialog.");
+      setCurrentOverlayMode("edit");
+      setMessage("The live overlay is active. Use × there to stop and return.");
     } catch (error) {
       setMessage(String(error));
     }

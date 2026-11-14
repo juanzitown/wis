@@ -1,12 +1,16 @@
-import { PointerEvent, useEffect, useRef, useState } from "react";
+import { CSSProperties, PointerEvent, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   getOverlayMode,
+  getRuntimeStatus,
   getSettings,
+  OcrUpdate,
   OverlayMode,
   Region,
+  RuntimeStatus,
   saveSettings,
   setOverlayMode,
+  stopOcr,
   WisSettings,
   fallbackSettings,
 } from "./tauri";
@@ -24,6 +28,9 @@ const minimumSize = 32;
 export default function Overlay() {
   const [settings, setSettings] = useState(fallbackSettings);
   const [mode, setMode] = useState<OverlayMode>("hidden");
+  const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  const [finding, setFinding] = useState<OcrUpdate | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
   const settingsRef = useRef(settings);
   const dragRef = useRef<DragState | null>(null);
 
@@ -33,9 +40,10 @@ export default function Overlay() {
   }
 
   useEffect(() => {
-    Promise.all([getSettings(), getOverlayMode()]).then(([loaded, loadedMode]) => {
+    Promise.all([getSettings(), getOverlayMode(), getRuntimeStatus()]).then(([loaded, loadedMode, loadedStatus]) => {
       updateSettings(loaded);
       setMode(loadedMode);
+      setStatus(loadedStatus);
     });
     const settingsSubscription = listen<WisSettings>("settings-changed", (event) => {
       if (!dragRef.current) updateSettings(event.payload);
@@ -43,9 +51,19 @@ export default function Overlay() {
     const modeSubscription = listen<OverlayMode>("overlay-mode-changed", (event) => {
       setMode(event.payload);
     });
+    const statusSubscription = listen<RuntimeStatus>("ocr-status", (event) => {
+      setStatus(event.payload);
+      if (event.payload.phase === "starting") setFinding(null);
+      if (event.payload.phase === "idle") setIsStopping(false);
+    });
+    const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
+      setFinding(event.payload);
+    });
     return () => {
       settingsSubscription.then((unlisten) => unlisten());
       modeSubscription.then((unlisten) => unlisten());
+      statusSubscription.then((unlisten) => unlisten());
+      ocrSubscription.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -53,6 +71,7 @@ export default function Overlay() {
     if (mode !== "edit") return;
     event.preventDefault();
     event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
     dragRef.current = {
       action,
       startX: event.clientX,
@@ -79,7 +98,34 @@ export default function Overlay() {
     saveSettings(settingsRef.current).catch(() => getSettings().then(updateSettings));
   }
 
+  async function closeCapture() {
+    if (isStopping) return;
+    setIsStopping(true);
+    try {
+      await stopOcr();
+    } catch {
+      setIsStopping(false);
+    }
+  }
+
   const region = settings.region;
+  const isActive = status?.phase !== "idle" && status !== null;
+  const controlsBelow = region.y < 44;
+  const controlStyle: CSSProperties = {
+    left: Math.min(Math.max(8, region.x + region.width - 32), Math.max(8, window.innerWidth - 40)),
+    top: controlsBelow ? region.y + region.height + 8 : region.y - 38,
+  };
+  const popupWidth = Math.min(320, window.innerWidth - 24);
+  const popupHeight = 150;
+  const roomBelow = window.innerHeight - (region.y + region.height);
+  const popupTop = roomBelow >= popupHeight + (controlsBelow ? 52 : 16)
+    ? region.y + region.height + (controlsBelow ? 52 : 12)
+    : Math.max(12, region.y - popupHeight - 12);
+  const findingStyle: CSSProperties = {
+    left: Math.min(Math.max(12, region.x), Math.max(12, window.innerWidth - popupWidth - 12)),
+    top: popupTop,
+    width: popupWidth,
+  };
   return (
     <div
       className={`overlay-surface ${mode === "edit" ? "is-editing" : ""}`}
@@ -101,7 +147,30 @@ export default function Overlay() {
           />
         ))}
       </div>
-      {mode === "edit" && (
+      {isActive && (
+        <button
+          aria-label="Stop OCR and return to wis"
+          className="overlay-close"
+          disabled={isStopping}
+          style={controlStyle}
+          type="button"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={closeCapture}
+        >
+          ×
+        </button>
+      )}
+      {isActive && (
+        <div className={`overlay-finding ${finding?.error ? "has-error" : ""}`} style={findingStyle}>
+          <div className="overlay-finding-heading">
+            <span>{finding ? "Latest finding" : "Looking…"}</span>
+            {finding && !finding.error && <small>{finding.confidence}%</small>}
+          </div>
+          <p>{finding?.error || finding?.text || (finding ? "No text found" : "Waiting for the first scan")}</p>
+          {finding && <small>{finding.elapsedMs}ms · {new Date(finding.observedAtMs).toLocaleTimeString()}</small>}
+        </div>
+      )}
+      {mode === "edit" && !isActive && (
         <>
           <div className="overlay-help">Move the area · drag a corner to resize</div>
           <div className="overlay-toolbar" onPointerDown={(event) => event.stopPropagation()}>

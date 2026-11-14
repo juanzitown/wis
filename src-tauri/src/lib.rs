@@ -190,7 +190,10 @@ fn start_ocr(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Runtim
         capture.last_error = None;
         capture.frame_size = None;
     }
-    hide_overlay(&app, &state);
+    show_capture_overlay(&app, &state)?;
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
 
     let worker_app = app.clone();
     thread::Builder::new()
@@ -220,19 +223,39 @@ fn stop_ocr(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Runtime
             capture.phase = CapturePhase::Stopping;
         }
     }
+    show_main_window(&app, &state);
     let status = runtime_status(&state)?;
     let _ = app.emit("ocr-status", &status);
     Ok(status)
 }
 
-fn hide_overlay(app: &tauri::AppHandle, state: &AppState) {
+fn show_capture_overlay(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let overlay = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "overlay window is not available".to_owned())?;
+    overlay.show().map_err(|error| error.to_string())?;
+    overlay
+        .set_ignore_cursor_events(false)
+        .map_err(|error| error.to_string())?;
+    if let Ok(mut mode) = state.overlay_mode.lock() {
+        *mode = "edit".to_owned();
+    }
+    let _ = app.emit_to("overlay", "overlay-mode-changed", "edit");
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle, state: &AppState) {
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.hide();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
     }
     if let Ok(mut mode) = state.overlay_mode.lock() {
         *mode = "hidden".to_owned();
     }
-    let _ = app.emit_to("overlay", "overlay-mode-changed", "hidden");
+    let _ = app.emit("overlay-mode-changed", "hidden");
 }
 
 fn run_ocr(app: tauri::AppHandle, stop: Arc<AtomicBool>) -> Result<(), String> {
@@ -451,11 +474,15 @@ fn set_capture_running(app: &tauri::AppHandle, frame_size: (u32, u32)) {
 }
 
 fn finish_capture(app: &tauri::AppHandle, error: Option<String>) {
+    let should_return_to_app = error.is_some();
     let state = app.state::<AppState>();
     if let Ok(mut capture) = state.capture.lock() {
         capture.phase = CapturePhase::Idle;
         capture.stop = None;
         capture.last_error = error;
+    }
+    if should_return_to_app {
+        show_main_window(app, &state);
     }
     if let Ok(status) = runtime_status(&state) {
         let _ = app.emit("ocr-status", status);

@@ -4,11 +4,12 @@
 
 ## What it does
 
-- Transparent, draggable, resizable text-area overlay.
+- Transparent text-area overlay that stays draggable and resizable while OCR runs.
 - Persistent area coordinates and scan interval.
 - Wayland screen capture through the XDG ScreenCast portal and PipeWire.
 - Periodic OpenCV preprocessing and Tesseract OCR.
-- Latest result, confidence, recognition time, and recent attempts.
+- Live overlay finding with confidence and recognition time, plus recent attempts in the main window.
+- One-click × control to stop capture and return to the main window.
 - No input automation and no application-specific recognition rules.
 
 ## Run on Bazzite
