@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use leptess::{LepTess, Variable};
 use opencv::{
     core::{self, Mat, Rect, Scalar, Size, Vector},
@@ -72,6 +73,7 @@ struct RuntimeStatus {
 struct OcrUpdate {
     text: String,
     confidence: i32,
+    preview_image_data_url: Option<String>,
     elapsed_ms: u128,
     observed_at_ms: u64,
     capture_width: u32,
@@ -295,22 +297,19 @@ fn run_ocr(app: tauri::AppHandle, stop: Arc<AtomicBool>) -> Result<(), String> {
         last_scan = Instant::now();
         let logical_size = overlay_dimensions(&app).unwrap_or(frame.size);
         let started = Instant::now();
-        let result = recognize_region(
+        let (text, confidence, preview_image_data_url, error) = recognize_region(
             &mut tesseract,
             &frame.vframe,
             frame.size,
             logical_size,
             settings.region,
         );
-        let (text, confidence, error) = match result {
-            Ok((text, confidence)) => (text, confidence, None),
-            Err(error) => (String::new(), 0, Some(error)),
-        };
         app.emit(
             "ocr-update",
             OcrUpdate {
                 text,
                 confidence,
+                preview_image_data_url,
                 elapsed_ms: started.elapsed().as_millis(),
                 observed_at_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -335,22 +334,35 @@ fn recognize_region(
     frame_size: (u32, u32),
     logical_size: (u32, u32),
     region: Region,
-) -> Result<(String, i32), String> {
-    let encoded = preprocess_region(frame, frame_size, logical_size, region)?;
-    tesseract
-        .set_image_from_mem(encoded.as_slice())
-        .map_err(|error| error.to_string())?;
-    tesseract.set_source_resolution(300);
-    let raw = tesseract
-        .get_utf8_text()
-        .map_err(|error| error.to_string())?;
-    let text = raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok((text, tesseract.mean_text_conf()))
+) -> (String, i32, Option<String>, Option<String>) {
+    let (encoded, preview) = match preprocess_region(frame, frame_size, logical_size, region) {
+        Ok(images) => images,
+        Err(error) => return (String::new(), 0, None, Some(error)),
+    };
+    let preview_image_data_url = Some(format!(
+        "data:image/png;base64,{}",
+        BASE64.encode(preview.as_slice())
+    ));
+    let result = (|| -> Result<(String, i32), String> {
+        tesseract
+            .set_image_from_mem(encoded.as_slice())
+            .map_err(|error| error.to_string())?;
+        tesseract.set_source_resolution(300);
+        let raw = tesseract
+            .get_utf8_text()
+            .map_err(|error| error.to_string())?;
+        let text = raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok((text, tesseract.mean_text_conf()))
+    })();
+    match result {
+        Ok((text, confidence)) => (text, confidence, preview_image_data_url, None),
+        Err(error) => (String::new(), 0, preview_image_data_url, Some(error)),
+    }
 }
 
 fn preprocess_region(
@@ -358,7 +370,7 @@ fn preprocess_region(
     frame_size: (u32, u32),
     logical_size: (u32, u32),
     region: Region,
-) -> Result<Vector<u8>, String> {
+) -> Result<(Vector<u8>, Vector<u8>), String> {
     let (frame_width, frame_height) = frame_size;
     let (logical_width, logical_height) = logical_size;
     if frame_width == 0 || frame_height == 0 || logical_width == 0 || logical_height == 0 {
@@ -454,7 +466,28 @@ fn preprocess_region(
     let mut encoded = Vector::new();
     imgcodecs::imencode(".png", &padded, &mut encoded, &Vector::new())
         .map_err(|error| error.to_string())?;
-    Ok(encoded)
+
+    let preview_scale = (480.0 / padded.cols() as f64)
+        .min(160.0 / padded.rows() as f64)
+        .min(1.0);
+    let preview_size = Size::new(
+        ((padded.cols() as f64 * preview_scale).round() as i32).max(1),
+        ((padded.rows() as f64 * preview_scale).round() as i32).max(1),
+    );
+    let mut preview_mat = Mat::default();
+    imgproc::resize(
+        &padded,
+        &mut preview_mat,
+        preview_size,
+        0.0,
+        0.0,
+        imgproc::INTER_AREA,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut preview = Vector::new();
+    imgcodecs::imencode(".png", &preview_mat, &mut preview, &Vector::new())
+        .map_err(|error| error.to_string())?;
+    Ok((encoded, preview))
 }
 
 fn overlay_dimensions(app: &tauri::AppHandle) -> Option<(u32, u32)> {

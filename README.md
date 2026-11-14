@@ -8,7 +8,7 @@
 - Persistent area coordinates and scan interval.
 - Wayland screen capture through the XDG ScreenCast portal and PipeWire.
 - Periodic OpenCV preprocessing and Tesseract OCR.
-- Live overlay finding with confidence and recognition time, plus recent attempts in the main window.
+- Expandable live overlay finding with confidence, recognition time, and a thumbnail of the processed image sent to OCR.
 - One-click × control to stop capture and return to the main window.
 - No input automation and no application-specific recognition rules.
 

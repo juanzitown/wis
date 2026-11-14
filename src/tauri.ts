@@ -27,6 +27,7 @@ export type RuntimeStatus = {
 export type OcrUpdate = {
   text: string;
   confidence: number;
+  previewImageDataUrl: string | null;
   elapsedMs: number;
   observedAtMs: number;
   captureWidth: number;

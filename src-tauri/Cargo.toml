@@ -12,6 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22"
 leptess = "0.14"
 opencv = { version = "0.102", default-features = false, features = ["clang-runtime", "imgcodecs", "imgproc"] }
 wis-core = { path = "../crates/wis-core" }

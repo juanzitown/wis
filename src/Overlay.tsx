@@ -115,16 +115,19 @@ export default function Overlay() {
     left: Math.min(Math.max(8, region.x + region.width - 32), Math.max(8, window.innerWidth - 40)),
     top: controlsBelow ? region.y + region.height + 8 : region.y - 38,
   };
-  const popupWidth = Math.min(320, window.innerWidth - 24);
-  const popupHeight = 150;
-  const roomBelow = window.innerHeight - (region.y + region.height);
-  const popupTop = roomBelow >= popupHeight + (controlsBelow ? 52 : 16)
-    ? region.y + region.height + (controlsBelow ? 52 : 12)
-    : Math.max(12, region.y - popupHeight - 12);
+  const popupWidth = Math.min(400, window.innerWidth - 24);
+  const popupHeight = Math.min(360, window.innerHeight - 24);
+  const belowTop = region.y + region.height + (controlsBelow ? 52 : 12);
+  const roomBelow = window.innerHeight - belowTop - 12;
+  const roomAbove = region.y - 24;
+  const placeBelow = roomBelow >= Math.min(220, popupHeight) || roomBelow >= roomAbove;
+  const availableHeight = Math.max(120, Math.min(popupHeight, placeBelow ? roomBelow : roomAbove));
+  const popupTop = placeBelow ? belowTop : Math.max(12, region.y - availableHeight - 12);
   const findingStyle: CSSProperties = {
     left: Math.min(Math.max(12, region.x), Math.max(12, window.innerWidth - popupWidth - 12)),
     top: popupTop,
     width: popupWidth,
+    maxHeight: availableHeight,
   };
   return (
     <div
@@ -139,7 +142,7 @@ export default function Overlay() {
         onPointerDown={(event) => startDrag(event, "move")}
       >
         <span className="overlay-label">Text area</span>
-        {(["nw", "ne", "sw", "se"] as DragAction[]).map((action) => (
+        {mode === "edit" && (["nw", "ne", "sw", "se"] as DragAction[]).map((action) => (
           <span
             className={`resize-handle handle-${action}`}
             key={action}
@@ -166,6 +169,12 @@ export default function Overlay() {
             <span>{finding ? "Latest finding" : "Looking…"}</span>
             {finding && !finding.error && <small>{finding.confidence}%</small>}
           </div>
+          {finding?.previewImageDataUrl && (
+            <figure className="overlay-preview">
+              <img src={finding.previewImageDataUrl} alt="Latest image sent to OCR" />
+              <figcaption>OCR input</figcaption>
+            </figure>
+          )}
           <p>{finding?.error || finding?.text || (finding ? "No text found" : "Waiting for the first scan")}</p>
           {finding && <small>{finding.elapsedMs}ms · {new Date(finding.observedAtMs).toLocaleTimeString()}</small>}
         </div>
