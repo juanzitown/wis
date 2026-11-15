@@ -9,24 +9,33 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use leptess::{LepTess, Variable};
-use opencv::{
-    core::{self, Mat, Point, Rect, Scalar, Size, Vector},
-    imgcodecs, imgproc,
-    prelude::*,
-};
 use scrcap::{CaptureConfig, CaptureDescriptor as _, Target, VideoConfig};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 use wis_core::{Region, WisSettings};
 
+pub mod text_clarity;
+mod text_isolation;
+
 struct AppState {
     settings: Mutex<WisSettings>,
     settings_path: PathBuf,
     overlay_mode: Mutex<String>,
-    mouse_position: Mutex<(u32, u32)>,
+    mouse_selection: Mutex<MouseSelectionState>,
     capture: Mutex<CaptureRuntime>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct MouseSelectionState {
+    region: Option<Region>,
+    revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingIsolation {
+    region: Region,
+    mouse_revision: Option<u64>,
+    started: Instant,
 }
 
 #[derive(Default)]
@@ -40,7 +49,6 @@ struct CaptureRuntime {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CaptureMode {
-    Manual,
     Auto,
     Mouse,
 }
@@ -48,16 +56,14 @@ enum CaptureMode {
 impl CaptureMode {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "manual" => Ok(Self::Manual),
             "auto" => Ok(Self::Auto),
             "mouse" => Ok(Self::Mouse),
-            _ => Err("capture mode must be manual, auto, or mouse".to_owned()),
+            _ => Err("capture mode must be auto or mouse".to_owned()),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Manual => "manual",
             Self::Auto => "auto",
             Self::Mouse => "mouse",
         }
@@ -99,27 +105,20 @@ struct RuntimeStatus {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DetectedLine {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct OcrUpdate {
     mode: &'static str,
     text: String,
     confidence: i32,
     preview_image_data_url: Option<String>,
     elapsed_ms: u128,
+    elapsed_micros: u128,
     observed_at_ms: u64,
     capture_width: u32,
     capture_height: u32,
     logical_width: u32,
     logical_height: u32,
-    detected_lines: Vec<DetectedLine>,
+    detected_lines: Vec<text_isolation::DetectedLine>,
+    isolation_steps: Vec<text_isolation::IsolationStep>,
     error: Option<String>,
 }
 
@@ -150,12 +149,22 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn update_mouse_position(x: u32, y: u32, state: State<'_, AppState>) -> Result<(), String> {
-    *state
-        .mouse_position
+fn submit_mouse_region(region: Region, state: State<'_, AppState>) -> Result<u64, String> {
+    if region.width < 2 || region.height < 2 {
+        return Err("drag a region at least 2×2 pixels".to_owned());
+    }
+    region
+        .x
+        .checked_add(region.width)
+        .and_then(|_| region.y.checked_add(region.height))
+        .ok_or_else(|| "mouse region coordinates overflow".to_owned())?;
+    let mut selection = state
+        .mouse_selection
         .lock()
-        .map_err(|_| "mouse position lock was poisoned".to_owned())? = (x, y);
-    Ok(())
+        .map_err(|_| "mouse selection lock was poisoned".to_owned())?;
+    selection.region = Some(region);
+    selection.revision = selection.revision.wrapping_add(1).max(1);
+    Ok(selection.revision)
 }
 
 #[tauri::command]
@@ -233,6 +242,13 @@ fn start_ocr(
     state: State<'_, AppState>,
 ) -> Result<RuntimeStatus, String> {
     let mode = CaptureMode::parse(&mode)?;
+    if mode == CaptureMode::Mouse {
+        *state
+            .mouse_selection
+            .lock()
+            .map_err(|_| "mouse selection lock was poisoned".to_owned())? =
+            MouseSelectionState::default();
+    }
     let stop = Arc::new(AtomicBool::new(false));
     {
         let mut capture = state
@@ -321,16 +337,6 @@ fn run_capture(
     stop: Arc<AtomicBool>,
     mode: CaptureMode,
 ) -> Result<(), String> {
-    let mut tesseract = if mode != CaptureMode::Auto {
-        let mut engine = LepTess::new(None, "eng")
-            .map_err(|error| format!("could not initialize Tesseract English OCR: {error}"))?;
-        engine
-            .set_variable(Variable::TesseditPagesegMode, "6")
-            .map_err(|_| "could not configure Tesseract for a text block".to_owned())?;
-        Some(engine)
-    } else {
-        None
-    };
     let capture = CaptureConfig {
         video: VideoConfig {
             channel_capacity: 2,
@@ -345,85 +351,102 @@ fn run_capture(
 
     set_capture_running(&app, capture.size());
     let mut last_scan = Instant::now() - Duration::from_secs(60);
-    let mut auto_settle_started: Option<Instant> = None;
+    let mut last_mouse_revision = 0_u64;
+    let mut pending_isolation: Option<PendingIsolation> = None;
     while !stop.load(Ordering::Acquire) {
         let frame = capture
             .video()
             .recv()
             .map_err(|_| "the PipeWire capture stream ended".to_owned())?;
-        let settings = app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .map_err(|_| "settings lock was poisoned".to_owned())?
-            .clone();
-        if mode == CaptureMode::Auto {
-            if let Some(started) = auto_settle_started {
-                // At 10 fps this discards at least one complete frame after
-                // the WebView removes its old borders from the compositor.
-                if started.elapsed() < Duration::from_millis(160) {
-                    continue;
-                }
-            } else {
-                if last_scan.elapsed() < Duration::from_millis(settings.scan_interval_ms) {
-                    continue;
-                }
-                app.emit_to("overlay", "auto-borders-visible", false)
-                    .map_err(|error| error.to_string())?;
-                auto_settle_started = Some(Instant::now());
+        let logical_size = overlay_dimensions(&app).unwrap_or(frame.size);
+        if let Some(pending) = pending_isolation {
+            // At 10 fps this discards at least one complete frame after
+            // the WebView removes its old borders from the compositor.
+            if pending.started.elapsed() < Duration::from_millis(160) {
                 continue;
             }
-        } else if last_scan.elapsed() < Duration::from_millis(settings.scan_interval_ms) {
+        } else {
+            let trigger = match mode {
+                CaptureMode::Auto => {
+                    let interval = app
+                        .state::<AppState>()
+                        .settings
+                        .lock()
+                        .map_err(|_| "settings lock was poisoned".to_owned())?
+                        .scan_interval_ms;
+                    if last_scan.elapsed() < Duration::from_millis(interval) {
+                        continue;
+                    }
+                    PendingIsolation {
+                        region: Region {
+                            x: 0,
+                            y: 0,
+                            width: logical_size.0,
+                            height: logical_size.1,
+                        },
+                        mouse_revision: None,
+                        started: Instant::now(),
+                    }
+                }
+                CaptureMode::Mouse => {
+                    let selection = *app
+                        .state::<AppState>()
+                        .mouse_selection
+                        .lock()
+                        .map_err(|_| "mouse selection lock was poisoned".to_owned())?;
+                    let Some(region) = selection.region else {
+                        continue;
+                    };
+                    if selection.revision <= last_mouse_revision {
+                        continue;
+                    }
+                    PendingIsolation {
+                        region,
+                        mouse_revision: Some(selection.revision),
+                        started: Instant::now(),
+                    }
+                }
+            };
+            app.emit_to("overlay", "isolation-borders-visible", false)
+                .map_err(|error| error.to_string())?;
+            pending_isolation = Some(trigger);
             continue;
         }
+        let pending = pending_isolation
+            .take()
+            .expect("a settled isolation must have pending bounds");
         last_scan = Instant::now();
-        auto_settle_started = None;
-        let logical_size = overlay_dimensions(&app).unwrap_or(frame.size);
         let started = Instant::now();
-        let (text, confidence, preview_image_data_url, detected_lines, error) = match mode {
-            CaptureMode::Manual => {
-                let (text, confidence, preview, error) = recognize_region(
-                    tesseract
-                        .as_mut()
-                        .expect("manual capture always initializes Tesseract"),
-                    &frame.vframe,
-                    frame.size,
-                    logical_size,
-                    settings.region,
-                );
-                (text, confidence, preview, Vec::new(), error)
-            }
-            CaptureMode::Auto => match detect_text_lines(&frame.vframe, frame.size, logical_size) {
-                Ok(lines) => (String::new(), 0, None, lines, None),
-                Err(error) => (String::new(), 0, None, Vec::new(), Some(error)),
-            },
-            CaptureMode::Mouse => {
-                let position = *app
-                    .state::<AppState>()
-                    .mouse_position
-                    .lock()
-                    .map_err(|_| "mouse position lock was poisoned".to_owned())?;
-                let mouse_region = region_at_mouse(position, logical_size);
-                let (text, confidence, preview, error) = recognize_region(
-                    tesseract
-                        .as_mut()
-                        .expect("mouse capture always initializes Tesseract"),
-                    &frame.vframe,
-                    frame.size,
-                    logical_size,
-                    mouse_region,
-                );
-                (text, confidence, preview, Vec::new(), error)
-            }
-        };
+        let (preview_image_data_url, detected_lines, isolation_steps, error) =
+            match text_isolation::isolate_text(
+                &frame.vframe,
+                frame.size,
+                logical_size,
+                pending.region,
+                mode == CaptureMode::Mouse,
+            ) {
+                Ok(result) => {
+                    let preview = result
+                        .steps
+                        .last()
+                        .map(|step| step.preview_image_data_url.clone());
+                    (preview, result.lines, result.steps, None)
+                }
+                Err(error) => (None, Vec::new(), Vec::new(), Some(error)),
+            };
+        if let Some(revision) = pending.mouse_revision {
+            last_mouse_revision = revision;
+        }
+        let elapsed = started.elapsed();
         app.emit(
             "ocr-update",
             OcrUpdate {
                 mode: mode.as_str(),
-                text,
-                confidence,
+                text: String::new(),
+                confidence: 0,
                 preview_image_data_url,
-                elapsed_ms: started.elapsed().as_millis(),
+                elapsed_ms: elapsed.as_millis(),
+                elapsed_micros: elapsed.as_micros(),
                 observed_at_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -433,6 +456,7 @@ fn run_capture(
                 logical_width: logical_size.0,
                 logical_height: logical_size.1,
                 detected_lines,
+                isolation_steps,
                 error,
             },
         )
@@ -440,430 +464,6 @@ fn run_capture(
     }
     capture.terminate();
     Ok(())
-}
-
-fn region_at_mouse(position: (u32, u32), logical_size: (u32, u32)) -> Region {
-    const WIDTH: u32 = 240;
-    const HEIGHT: u32 = 120;
-    let width = WIDTH.min(logical_size.0.max(1));
-    let height = HEIGHT.min(logical_size.1.max(1));
-    Region {
-        x: mouse_axis_start(position.0, width, logical_size.0),
-        y: mouse_axis_start(position.1, height, logical_size.1),
-        width,
-        height,
-    }
-}
-
-fn mouse_axis_start(position: u32, size: u32, screen_size: u32) -> u32 {
-    if screen_size <= size {
-        0
-    } else if position.saturating_add(size) <= screen_size {
-        position
-    } else {
-        position.saturating_sub(size)
-    }
-}
-
-fn detect_text_lines(
-    frame: &[u8],
-    frame_size: (u32, u32),
-    logical_size: (u32, u32),
-) -> Result<Vec<DetectedLine>, String> {
-    let (frame_width, frame_height) = frame_size;
-    let (logical_width, logical_height) = logical_size;
-    if frame_width == 0 || frame_height == 0 || logical_width == 0 || logical_height == 0 {
-        return Err("capture and logical dimensions must be non-zero".to_owned());
-    }
-    let expected = frame_width as usize * frame_height as usize * 4;
-    if frame.len() < expected {
-        return Err(format!(
-            "BGRA frame is too short: expected {expected} bytes, received {}",
-            frame.len()
-        ));
-    }
-
-    let source = Mat::from_slice(&frame[..expected]).map_err(|error| error.to_string())?;
-    let source = source
-        .reshape(4, frame_height as i32)
-        .map_err(|error| error.to_string())?;
-    let mut bgr = Mat::default();
-    imgproc::cvt_color_def(&source, &mut bgr, imgproc::COLOR_BGRA2BGR)
-        .map_err(|error| error.to_string())?;
-
-    // Smooth tiny texture/color fluctuations, then keep the strongest glyph
-    // edge found in any B, G, or R channel. Looking at channels separately
-    // retains colored text that can nearly disappear after grayscale mixing.
-    let edge_kernel =
-        imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(3, 3), Point::new(-1, -1))
-            .map_err(|error| error.to_string())?;
-    let mut gradient = Mat::default();
-    for channel_index in 0..3 {
-        let mut channel = Mat::default();
-        core::extract_channel(&bgr, &mut channel, channel_index)
-            .map_err(|error| error.to_string())?;
-        let mut smoothed = Mat::default();
-        imgproc::gaussian_blur_def(&channel, &mut smoothed, Size::new(3, 3), 0.0)
-            .map_err(|error| error.to_string())?;
-        let mut channel_gradient = Mat::default();
-        imgproc::morphology_ex(
-            &smoothed,
-            &mut channel_gradient,
-            imgproc::MORPH_GRADIENT,
-            &edge_kernel,
-            Point::new(-1, -1),
-            1,
-            core::BORDER_CONSTANT,
-            Scalar::all(0.0),
-        )
-        .map_err(|error| error.to_string())?;
-        if channel_index == 0 {
-            gradient = channel_gradient;
-        } else {
-            let mut combined = Mat::default();
-            core::max(&gradient, &channel_gradient, &mut combined)
-                .map_err(|error| error.to_string())?;
-            gradient = combined;
-        }
-    }
-    let mut edges = Mat::default();
-    let otsu_threshold = imgproc::threshold(
-        &gradient,
-        &mut edges,
-        0.0,
-        255.0,
-        imgproc::THRESH_BINARY | imgproc::THRESH_OTSU,
-    )
-    .map_err(|error| error.to_string())?;
-    // Otsu is screen-global and can be biased upward by a few very bright UI
-    // elements. Keep its adaptive baseline, but admit slightly weaker badge
-    // and colored-text edges into the candidate pass.
-    let relaxed_threshold = (otsu_threshold * 0.82).max(3.0);
-    imgproc::threshold(
-        &gradient,
-        &mut edges,
-        relaxed_threshold,
-        255.0,
-        imgproc::THRESH_BINARY,
-    )
-    .map_err(|error| error.to_string())?;
-
-    // Join neighboring glyphs only along X. A one-pixel-high kernel prevents
-    // adjacent rows from collapsing into a paragraph-sized block.
-    const MAX_LOGICAL_LINE_GAP: u32 = 12;
-    let maximum_line_gap = ((MAX_LOGICAL_LINE_GAP as u64 * frame_width as u64
-        + logical_width as u64 / 2)
-        / logical_width as u64)
-        .max(1) as i32;
-    let kernel_width = (maximum_line_gap.clamp(5, 17) | 1) as i32;
-    let line_kernel = imgproc::get_structuring_element(
-        imgproc::MORPH_RECT,
-        Size::new(kernel_width, 1),
-        Point::new(-1, -1),
-    )
-    .map_err(|error| error.to_string())?;
-    let mut connected = Mat::default();
-    imgproc::morphology_ex(
-        &edges,
-        &mut connected,
-        imgproc::MORPH_CLOSE,
-        &line_kernel,
-        Point::new(-1, -1),
-        1,
-        core::BORDER_CONSTANT,
-        Scalar::all(0.0),
-    )
-    .map_err(|error| error.to_string())?;
-
-    let mut contours: Vector<Vector<Point>> = Vector::new();
-    imgproc::find_contours(
-        &connected,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        Point::new(0, 0),
-    )
-    .map_err(|error| error.to_string())?;
-
-    let scale = |value: u32, captured: u32, logical: u32| {
-        ((value as u64 * logical as u64 + captured as u64 / 2) / captured as u64) as u32
-    };
-    let maximum_height = (frame_height / 8).max(32) as i32;
-    let mut candidates = Vec::new();
-    for index in 0..contours.len() {
-        let contour = contours.get(index).map_err(|error| error.to_string())?;
-        let rect = imgproc::bounding_rect(&contour).map_err(|error| error.to_string())?;
-        let area = rect.width.saturating_mul(rect.height);
-        if rect.width < 6 || rect.height < 4 || rect.height > maximum_height || area < 40 {
-            continue;
-        }
-        // Text has repeated internal edges and visible channel variation.
-        // Flat silhouettes tend to contribute only a sparse perimeter.
-        let edge_roi = Mat::roi(&edges, rect).map_err(|error| error.to_string())?;
-        let edge_density = core::count_non_zero(&edge_roi).map_err(|error| error.to_string())?
-            as f64
-            / area as f64;
-        let minimum_density = if area < 800 { 0.009 } else { 0.015 };
-        if edge_density < minimum_density || edge_density > 0.72 {
-            continue;
-        }
-        let color_roi = Mat::roi(&bgr, rect).map_err(|error| error.to_string())?;
-        let mut mean = Mat::default();
-        let mut deviation = Mat::default();
-        core::mean_std_dev(&color_roi, &mut mean, &mut deviation, &core::no_array())
-            .map_err(|error| error.to_string())?;
-        let strongest_deviation = deviation
-            .data_typed::<f64>()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .copied()
-            .fold(0.0, f64::max);
-        if strongest_deviation < 3.5 {
-            continue;
-        }
-        if has_excessive_local_color(&bgr, rect)? {
-            continue;
-        }
-        // Ignore the overlay's stop button in Auto mode.
-        if rect.x > frame_width.saturating_sub(80) as i32 && rect.y < 80 {
-            continue;
-        }
-
-        candidates.push(rect);
-    }
-
-    candidates.sort_by_key(|rect| (rect.y, rect.x));
-    let mut lines = Vec::new();
-    for rect in candidates {
-        let left = rect.x.saturating_sub(4).max(0) as u32;
-        let top = rect.y.saturating_sub(2).max(0) as u32;
-        let right = (rect.x + rect.width + 4).max(0) as u32;
-        let bottom = (rect.y + rect.height + 2).max(0) as u32;
-        let x = scale(left.min(frame_width), frame_width, logical_width);
-        let y = scale(top.min(frame_height), frame_height, logical_height);
-        let scaled_right = scale(right.min(frame_width), frame_width, logical_width);
-        let scaled_bottom = scale(bottom.min(frame_height), frame_height, logical_height);
-        lines.push(DetectedLine {
-            x,
-            y,
-            width: scaled_right.saturating_sub(x).max(1),
-            height: scaled_bottom.saturating_sub(y).max(1),
-        });
-    }
-    lines.sort_by_key(|line| (line.y, line.x));
-    lines.truncate(256);
-    Ok(lines)
-}
-
-fn has_excessive_local_color(bgr: &Mat, rect: Rect) -> Result<bool, String> {
-    if rect.width < 3 || rect.height < 3 {
-        return Ok(false);
-    }
-
-    let mut checked_windows = 0_u32;
-    let mut colorful_windows = 0_u32;
-    let sample_step = (rect.width.max(rect.height) / 64).max(2);
-    let mut center_y = 1;
-    while center_y < rect.height - 1 {
-        let mut center_x = 1;
-        while center_x < rect.width - 1 {
-            let mut colors = [0_u16; 9];
-            let mut color_count = 0_usize;
-            for offset_y in -1..=1 {
-                for offset_x in -1..=1 {
-                    let pixel = *bgr
-                        .at_2d::<core::Vec3b>(
-                            rect.y + center_y + offset_y,
-                            rect.x + center_x + offset_x,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    // Quantize to eight levels per channel. This collapses
-                    // antialias shades while preserving genuinely different
-                    // local colors from photos, avatars, and rich icons.
-                    let color = ((pixel[0] as u16 >> 5) << 6)
-                        | ((pixel[1] as u16 >> 5) << 3)
-                        | (pixel[2] as u16 >> 5);
-                    if !colors[..color_count].contains(&color) {
-                        colors[color_count] = color;
-                        color_count += 1;
-                    }
-                }
-            }
-            checked_windows += 1;
-            if color_count >= 6 {
-                colorful_windows += 1;
-            }
-            center_x += sample_step;
-        }
-        center_y += sample_step;
-    }
-
-    // Require several samples so tiny glyphs are not rejected from one noisy
-    // antialiased corner. Text can tolerate some colorful neighborhoods, but
-    // image-like candidates tend to exceed this ratio consistently.
-    Ok(checked_windows >= 6 && colorful_windows * 100 > checked_windows * 28)
-}
-
-fn recognize_region(
-    tesseract: &mut LepTess,
-    frame: &[u8],
-    frame_size: (u32, u32),
-    logical_size: (u32, u32),
-    region: Region,
-) -> (String, i32, Option<String>, Option<String>) {
-    let (encoded, preview) = match preprocess_region(frame, frame_size, logical_size, region) {
-        Ok(images) => images,
-        Err(error) => return (String::new(), 0, None, Some(error)),
-    };
-    let preview_image_data_url = Some(format!(
-        "data:image/png;base64,{}",
-        BASE64.encode(preview.as_slice())
-    ));
-    let result = (|| -> Result<(String, i32), String> {
-        tesseract
-            .set_image_from_mem(encoded.as_slice())
-            .map_err(|error| error.to_string())?;
-        tesseract.set_source_resolution(300);
-        let raw = tesseract
-            .get_utf8_text()
-            .map_err(|error| error.to_string())?;
-        let text = raw
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok((text, tesseract.mean_text_conf()))
-    })();
-    match result {
-        Ok((text, confidence)) => (text, confidence, preview_image_data_url, None),
-        Err(error) => (String::new(), 0, preview_image_data_url, Some(error)),
-    }
-}
-
-fn preprocess_region(
-    frame: &[u8],
-    frame_size: (u32, u32),
-    logical_size: (u32, u32),
-    region: Region,
-) -> Result<(Vector<u8>, Vector<u8>), String> {
-    let (frame_width, frame_height) = frame_size;
-    let (logical_width, logical_height) = logical_size;
-    if frame_width == 0 || frame_height == 0 || logical_width == 0 || logical_height == 0 {
-        return Err("capture and logical dimensions must be non-zero".to_owned());
-    }
-    let expected = frame_width as usize * frame_height as usize * 4;
-    if frame.len() < expected {
-        return Err(format!(
-            "BGRA frame is too short: expected {expected} bytes, received {}",
-            frame.len()
-        ));
-    }
-
-    let scale = |value: u32, captured: u32, logical: u32| {
-        ((value as u64 * captured as u64 + logical as u64 / 2) / logical as u64) as u32
-    };
-    let left = scale(region.x, frame_width, logical_width).min(frame_width);
-    let top = scale(region.y, frame_height, logical_height).min(frame_height);
-    let right = scale(
-        region.x.saturating_add(region.width),
-        frame_width,
-        logical_width,
-    )
-    .min(frame_width);
-    let bottom = scale(
-        region.y.saturating_add(region.height),
-        frame_height,
-        logical_height,
-    )
-    .min(frame_height);
-    if right <= left || bottom <= top {
-        return Err("the text area is outside the captured screen".to_owned());
-    }
-
-    let source = Mat::from_slice(&frame[..expected]).map_err(|error| error.to_string())?;
-    let source = source
-        .reshape(4, frame_height as i32)
-        .map_err(|error| error.to_string())?;
-    let roi = Mat::roi(
-        &source,
-        Rect::new(
-            left as i32,
-            top as i32,
-            (right - left) as i32,
-            (bottom - top) as i32,
-        ),
-    )
-    .map_err(|error| error.to_string())?;
-
-    let mut enlarged = Mat::default();
-    imgproc::resize(
-        &roi,
-        &mut enlarged,
-        Size::new(roi.cols() * 2, roi.rows() * 2),
-        0.0,
-        0.0,
-        imgproc::INTER_CUBIC,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut gray = Mat::default();
-    imgproc::cvt_color_def(&enlarged, &mut gray, imgproc::COLOR_BGRA2GRAY)
-        .map_err(|error| error.to_string())?;
-    let mut binary = Mat::default();
-    imgproc::threshold(
-        &gray,
-        &mut binary,
-        0.0,
-        255.0,
-        imgproc::THRESH_BINARY | imgproc::THRESH_OTSU,
-    )
-    .map_err(|error| error.to_string())?;
-    if core::count_non_zero(&binary).map_err(|error| error.to_string())?
-        < (binary.rows() * binary.cols()) / 2
-    {
-        let mut inverted = Mat::default();
-        core::bitwise_not(&binary, &mut inverted, &core::no_array())
-            .map_err(|error| error.to_string())?;
-        binary = inverted;
-    }
-
-    let mut padded = Mat::default();
-    core::copy_make_border(
-        &binary,
-        &mut padded,
-        16,
-        16,
-        16,
-        16,
-        core::BORDER_CONSTANT,
-        Scalar::all(255.0),
-    )
-    .map_err(|error| error.to_string())?;
-    let mut encoded = Vector::new();
-    imgcodecs::imencode(".png", &padded, &mut encoded, &Vector::new())
-        .map_err(|error| error.to_string())?;
-
-    let preview_scale = (480.0 / padded.cols() as f64)
-        .min(160.0 / padded.rows() as f64)
-        .min(1.0);
-    let preview_size = Size::new(
-        ((padded.cols() as f64 * preview_scale).round() as i32).max(1),
-        ((padded.rows() as f64 * preview_scale).round() as i32).max(1),
-    );
-    let mut preview_mat = Mat::default();
-    imgproc::resize(
-        &padded,
-        &mut preview_mat,
-        preview_size,
-        0.0,
-        0.0,
-        imgproc::INTER_AREA,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut preview = Vector::new();
-    imgcodecs::imencode(".png", &preview_mat, &mut preview, &Vector::new())
-        .map_err(|error| error.to_string())?;
-    Ok((encoded, preview))
 }
 
 fn overlay_dimensions(app: &tauri::AppHandle) -> Option<(u32, u32)> {
@@ -925,7 +525,7 @@ pub fn run() {
                 settings: Mutex::new(settings),
                 settings_path,
                 overlay_mode: Mutex::new("hidden".to_owned()),
-                mouse_position: Mutex::new((640, 480)),
+                mouse_selection: Mutex::new(MouseSelectionState::default()),
                 capture: Mutex::new(CaptureRuntime::default()),
             });
             Ok(())
@@ -933,7 +533,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            update_mouse_position,
+            submit_mouse_region,
             get_overlay_mode,
             set_overlay_mode,
             get_runtime_status,

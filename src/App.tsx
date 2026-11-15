@@ -13,38 +13,6 @@ import {
   WisSettings,
 } from "./tauri";
 
-type RegionKey = "x" | "y" | "width" | "height";
-
-function NumberField({
-  label,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max?: number;
-  step?: number;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <label className="field">
-      <span>{label}</span>
-      <input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        step={step}
-        onChange={(event) => onChange(Number(event.target.value))}
-      />
-    </label>
-  );
-}
-
 export default function App() {
   const [settings, setSettings] = useState<WisSettings>(fallbackSettings);
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
@@ -56,7 +24,7 @@ export default function App() {
       ([loadedSettings, loadedStatus]) => {
         setSettings(loadedSettings);
         setStatus(loadedStatus);
-        setMessage("Choose manual, mouse, or automatic text-line detection.");
+        setMessage("Choose a Mouse region or full-screen Auto isolation.");
       },
     );
     const settingsSubscription = listen<WisSettings>("settings-changed", (event) => {
@@ -78,20 +46,11 @@ export default function App() {
     };
   }, []);
 
-  function updateRegion(key: RegionKey, value: number) {
-    if (!Number.isFinite(value)) return;
-    const minimum = key === "width" || key === "height" ? 1 : 0;
-    setSettings((current) => ({
-      ...current,
-      region: { ...current.region, [key]: Math.max(minimum, Math.round(value)) },
-    }));
-  }
-
   async function save() {
     try {
       const saved = await saveSettings(settings);
       setSettings(saved);
-      setMessage("Text area and scan interval saved.");
+      setMessage("Scan interval saved.");
     } catch (error) {
       setMessage(String(error));
     }
@@ -105,11 +64,9 @@ export default function App() {
       const next = await startOcr(mode);
       setStatus(next);
       setMessage(
-        mode === "manual"
-          ? "Manual OCR is active. Drag or resize the area on screen."
-          : mode === "mouse"
-            ? "Mouse OCR is reading a 240×120 area beside the pointer."
-            : "Auto detection is scanning the screen for text lines.",
+        mode === "mouse"
+          ? "Drag around a screen region; isolation starts when you release the mouse."
+          : "Auto isolation is scanning the whole screen.",
       );
     } catch (error) {
       setMessage(String(error));
@@ -134,7 +91,7 @@ export default function App() {
         <div>
           <p className="wordmark">wis <span>/ what i see</span></p>
           <h1>Watch a piece of your screen.</h1>
-          <p className="lede">Read a manual area, follow the mouse, or outline every text line wis can find.</p>
+          <p className="lede">Drag around one region or isolate text-like glyphs across the whole screen.</p>
         </div>
         <div className={`runtime-badge ${status?.running ? "is-running" : ""}`}>
           <span />
@@ -152,17 +109,10 @@ export default function App() {
             <span className="mode">{status?.mode ?? "ready"}</span>
           </div>
 
-          <div className="field-grid">
-            <NumberField label="X" value={settings.region.x} min={0} onChange={(value) => updateRegion("x", value)} />
-            <NumberField label="Y" value={settings.region.y} min={0} onChange={(value) => updateRegion("y", value)} />
-            <NumberField label="Width" value={settings.region.width} min={32} max={8192} onChange={(value) => updateRegion("width", value)} />
-            <NumberField label="Height" value={settings.region.height} min={32} max={8192} onChange={(value) => updateRegion("height", value)} />
-          </div>
-
           <div className="interval-row">
             <div>
               <strong>Look every</strong>
-              <small>How often Manual, Mouse, or Auto mode scans</small>
+              <small>Auto mode scan interval; Mouse runs when a drag selection is released</small>
             </div>
             <div className="interval-input">
               <input
@@ -182,8 +132,7 @@ export default function App() {
           </div>
 
           <div className="button-row">
-            <button className="primary" type="button" disabled={!isIdle} onClick={() => beginWatching("manual")}>Start manual</button>
-            <button className="secondary" type="button" disabled={!isIdle} onClick={() => beginWatching("mouse")}>Start mouse</button>
+            <button className="primary" type="button" disabled={!isIdle} onClick={() => beginWatching("mouse")}>Start mouse</button>
             <button className="secondary" type="button" disabled={!isIdle} onClick={() => beginWatching("auto")}>Start auto</button>
             <button className="secondary" type="button" disabled={isIdle} onClick={endWatching}>Stop</button>
             <button className="quiet" type="button" disabled={!isIdle} onClick={save}>Save</button>
@@ -195,7 +144,7 @@ export default function App() {
           <div className="section-heading">
             <div>
               <p className="kicker">Findings</p>
-              <h2>Latest text</h2>
+              <h2>Latest isolation</h2>
             </div>
             {latest && <time>{new Date(latest.observedAtMs).toLocaleTimeString()}</time>}
           </div>
@@ -206,10 +155,10 @@ export default function App() {
             ) : latest.error ? (
               <p>{latest.error}</p>
             ) : (
-              <pre>{latest.text || "No text found"}</pre>
+              <pre>{latest.detectedLines.length} text-like region{latest.detectedLines.length === 1 ? "" : "s"} found</pre>
             )}
             {latest && !latest.error && (
-              <small>{latest.confidence}% confidence · {latest.elapsedMs}ms</small>
+              <small>{latest.isolationSteps.length} retained steps · {formatDuration(latest.elapsedMicros)}</small>
             )}
           </div>
 
@@ -221,8 +170,8 @@ export default function App() {
             {findings.slice(1).map((finding) => (
               <div className="history-item" key={`${finding.observedAtMs}-${finding.elapsedMs}`}>
                 <time>{new Date(finding.observedAtMs).toLocaleTimeString()}</time>
-                <p>{finding.error || finding.text || "No text found"}</p>
-                <span>{finding.error ? "error" : `${finding.confidence}%`}</span>
+                <p>{finding.error || `${finding.detectedLines.length} text-like regions`}</p>
+                <span>{finding.error ? "error" : formatDuration(finding.elapsedMicros)}</span>
               </div>
             ))}
           </div>
@@ -235,4 +184,11 @@ export default function App() {
       </section>
     </main>
   );
+}
+
+function formatDuration(micros: number): string {
+  if (micros < 1) return "<1µs";
+  if (micros < 1_000) return `${Math.round(micros)}µs`;
+  if (micros < 10_000) return `${(micros / 1_000).toFixed(2)}ms`;
+  return `${(micros / 1_000).toFixed(1)}ms`;
 }

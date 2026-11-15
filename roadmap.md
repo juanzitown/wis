@@ -1,9 +1,11 @@
 Features
 
 - [x] make the latest findings popup scrollable
-- [x] add Mouse mode with a 240x120 pointer-anchored OCR area, findings, and thumbnail
+- [x] add one-shot click-drag-release Mouse isolation with a persistent selection border
+- [x] remove Manual mode and share text isolation between Mouse and Auto
+- [x] retain named isolation-stage previews only for Mouse mode
 - [ ] detect and process complete text lines
-  - [x] add Manual and Auto modes while preserving the single draggable Manual area
+  - [x] converge Mouse and Auto on the same text-isolation pipeline
   - [x] group glyph fragments horizontally without merging neighboring rows
   - [x] keep every horizontally connected contour as an independent line candidate
   - [x] show thin Auto-mode borders around detected lines

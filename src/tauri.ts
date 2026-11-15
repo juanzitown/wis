@@ -13,7 +13,13 @@ export type WisSettings = {
 };
 
 export type OverlayMode = "hidden" | "edit" | "preview";
-export type CaptureMode = "manual" | "auto" | "mouse";
+export type CaptureMode = "auto" | "mouse";
+
+export type IsolationStep = {
+  name: string;
+  previewImageDataUrl: string;
+  elapsedMicros: number | null;
+};
 
 export type RuntimeStatus = {
   platform: string;
@@ -32,12 +38,14 @@ export type OcrUpdate = {
   confidence: number;
   previewImageDataUrl: string | null;
   elapsedMs: number;
+  elapsedMicros: number;
   observedAtMs: number;
   captureWidth: number;
   captureHeight: number;
   logicalWidth: number;
   logicalHeight: number;
   detectedLines: Region[];
+  isolationSteps: IsolationStep[];
   error: string | null;
 };
 
@@ -83,8 +91,15 @@ export function stopOcr() {
   return invoke<RuntimeStatus>("stop_ocr");
 }
 
-export function updateMousePosition(x: number, y: number) {
-  return invoke<void>("update_mouse_position", { x: Math.round(x), y: Math.round(y) });
+export function submitMouseRegion(region: Region) {
+  return invoke<number>("submit_mouse_region", {
+    region: {
+      x: Math.round(region.x),
+      y: Math.round(region.y),
+      width: Math.round(region.width),
+      height: Math.round(region.height),
+    },
+  });
 }
 
 export async function getOverlayMode(): Promise<OverlayMode> {

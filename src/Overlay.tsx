@@ -1,158 +1,103 @@
 import { CSSProperties, PointerEvent, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
-  getOverlayMode,
   getRuntimeStatus,
-  getSettings,
   OcrUpdate,
-  OverlayMode,
   Region,
   RuntimeStatus,
-  saveSettings,
   stopOcr,
-  updateMousePosition,
-  WisSettings,
-  fallbackSettings,
+  submitMouseRegion,
 } from "./tauri";
 
-type DragAction = "move" | "nw" | "ne" | "sw" | "se";
-type DragState = {
-  action: DragAction;
+type DragSelection = {
   startX: number;
   startY: number;
-  initial: Region;
 };
 
-const minimumSize = 32;
-const mouseAreaWidth = 240;
-const mouseAreaHeight = 120;
-
 export default function Overlay() {
-  const [settings, setSettings] = useState(fallbackSettings);
-  const [mode, setMode] = useState<OverlayMode>("hidden");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [finding, setFinding] = useState<OcrUpdate | null>(null);
-  const [autoBordersVisible, setAutoBordersVisible] = useState(false);
+  const [selection, setSelection] = useState<Region | null>(null);
+  const [draftSelection, setDraftSelection] = useState<Region | null>(null);
+  const [selectionError, setSelectionError] = useState<string | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [isolationBordersVisible, setIsolationBordersVisible] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
-  const [mousePosition, setMousePosition] = useState(() => ({
-    x: window.innerWidth / 2,
-    y: window.innerHeight / 2,
-  }));
-  const settingsRef = useRef(settings);
-  const dragRef = useRef<DragState | null>(null);
-  const lastMouseUpdateRef = useRef(0);
-  const pendingMouseUpdateRef = useRef<number | null>(null);
-
-  function updateSettings(next: WisSettings) {
-    settingsRef.current = next;
-    setSettings(next);
-  }
+  const dragRef = useRef<DragSelection | null>(null);
 
   useEffect(() => {
-    Promise.all([getSettings(), getOverlayMode(), getRuntimeStatus()]).then(([loaded, loadedMode, loadedStatus]) => {
-      updateSettings(loaded);
-      setMode(loadedMode);
-      setStatus(loadedStatus);
-    });
-    const settingsSubscription = listen<WisSettings>("settings-changed", (event) => {
-      if (!dragRef.current) updateSettings(event.payload);
-    });
-    const modeSubscription = listen<OverlayMode>("overlay-mode-changed", (event) => {
-      setMode(event.payload);
-    });
+    getRuntimeStatus().then(setStatus);
     const statusSubscription = listen<RuntimeStatus>("ocr-status", (event) => {
       setStatus(event.payload);
       if (event.payload.phase === "starting") {
         setFinding(null);
-        setAutoBordersVisible(false);
-        if (event.payload.mode === "mouse") {
-          const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-          setMousePosition(center);
-          updateMousePosition(center.x, center.y).catch(() => undefined);
-        }
+        setSelection(null);
+        setDraftSelection(null);
+        setSelectionError(null);
+        setIsolationBordersVisible(false);
       }
       if (event.payload.phase === "idle") {
         setIsStopping(false);
-        if (pendingMouseUpdateRef.current !== null) {
-          window.clearTimeout(pendingMouseUpdateRef.current);
-          pendingMouseUpdateRef.current = null;
-        }
+        dragRef.current = null;
+        setIsSelecting(false);
       }
     });
-    const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
+    const isolationSubscription = listen<OcrUpdate>("ocr-update", (event) => {
       setFinding(event.payload);
-      if (event.payload.mode === "auto") setAutoBordersVisible(true);
+      setIsolationBordersVisible(true);
     });
-    const autoVisibilitySubscription = listen<boolean>("auto-borders-visible", (event) => {
-      setAutoBordersVisible(event.payload);
+    const visibilitySubscription = listen<boolean>("isolation-borders-visible", (event) => {
+      setIsolationBordersVisible(event.payload);
     });
     return () => {
-      settingsSubscription.then((unlisten) => unlisten());
-      modeSubscription.then((unlisten) => unlisten());
       statusSubscription.then((unlisten) => unlisten());
-      ocrSubscription.then((unlisten) => unlisten());
-      autoVisibilitySubscription.then((unlisten) => unlisten());
-      if (pendingMouseUpdateRef.current !== null) {
-        window.clearTimeout(pendingMouseUpdateRef.current);
-      }
+      isolationSubscription.then((unlisten) => unlisten());
+      visibilitySubscription.then((unlisten) => unlisten());
     };
   }, []);
 
-  function startDrag(event: PointerEvent, action: DragAction) {
-    if (mode !== "edit" || (status?.phase !== "idle" && status?.mode !== "manual")) return;
+  const isActive = status?.phase !== "idle" && status !== null;
+  const isAutoActive = isActive && status?.mode === "auto";
+  const isMouseActive = isActive && status?.mode === "mouse";
+
+  function startSelection(event: PointerEvent<HTMLDivElement>) {
+    if (!isMouseActive || event.button !== 0) return;
     event.preventDefault();
-    event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
-    dragRef.current = {
-      action,
-      startX: event.clientX,
-      startY: event.clientY,
-      initial: { ...settingsRef.current.region },
-    };
+    const point = clampPoint(event.clientX, event.clientY);
+    dragRef.current = { startX: point.x, startY: point.y };
+    setDraftSelection({ x: point.x, y: point.y, width: 1, height: 1 });
+    setSelectionError(null);
+    setFinding(null);
+    setIsSelecting(true);
+    setIsolationBordersVisible(true);
   }
 
-  function moveDrag(event: PointerEvent) {
+  function moveSelection(event: PointerEvent<HTMLDivElement>) {
     const drag = dragRef.current;
     if (!drag) return;
-    const region = resizeRegion(
-      drag.initial,
-      drag.action,
-      Math.round(event.clientX - drag.startX),
-      Math.round(event.clientY - drag.startY),
-    );
-    updateSettings({ ...settingsRef.current, region });
+    const point = clampPoint(event.clientX, event.clientY);
+    setDraftSelection(regionBetween(drag.startX, drag.startY, point.x, point.y));
   }
 
-  function movePointer(event: PointerEvent) {
-    moveDrag(event);
-    if (status?.mode !== "mouse" || status.phase === "idle") return;
-    const next = {
-      x: Math.max(0, Math.min(window.innerWidth, event.clientX)),
-      y: Math.max(0, Math.min(window.innerHeight, event.clientY)),
-    };
-    setMousePosition(next);
-    const now = performance.now();
-    const remaining = 50 - (now - lastMouseUpdateRef.current);
-    if (pendingMouseUpdateRef.current !== null) {
-      window.clearTimeout(pendingMouseUpdateRef.current);
-      pendingMouseUpdateRef.current = null;
-    }
-    if (remaining <= 0) {
-      lastMouseUpdateRef.current = now;
-      updateMousePosition(next.x, next.y).catch(() => undefined);
-    } else {
-      pendingMouseUpdateRef.current = window.setTimeout(() => {
-        pendingMouseUpdateRef.current = null;
-        lastMouseUpdateRef.current = performance.now();
-        updateMousePosition(next.x, next.y).catch(() => undefined);
-      }, remaining);
-    }
-  }
-
-  function finishDrag() {
-    if (!dragRef.current) return;
+  function finishSelection(event: PointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const point = clampPoint(event.clientX, event.clientY);
+    const region = regionBetween(drag.startX, drag.startY, point.x, point.y);
     dragRef.current = null;
-    saveSettings(settingsRef.current).catch(() => getSettings().then(updateSettings));
+    setDraftSelection(null);
+    setIsSelecting(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (region.width < 2 || region.height < 2) {
+      setSelectionError("Click and drag to select an area.");
+      return;
+    }
+    setSelection(region);
+    setIsolationBordersVisible(true);
+    submitMouseRegion(region).catch((error) => setSelectionError(String(error)));
   }
 
   async function closeCapture() {
@@ -165,71 +110,54 @@ export default function Overlay() {
     }
   }
 
-  const isActive = status?.phase !== "idle" && status !== null;
-  const isManualActive = isActive && status?.mode === "manual";
-  const isAutoActive = isActive && status?.mode === "auto";
-  const isMouseActive = isActive && status?.mode === "mouse";
-  const mouseRegion: Region = {
-    x: mouseAxisStart(mousePosition.x, mouseAreaWidth, window.innerWidth),
-    y: mouseAxisStart(mousePosition.y, mouseAreaHeight, window.innerHeight),
-    width: Math.min(mouseAreaWidth, window.innerWidth),
-    height: Math.min(mouseAreaHeight, window.innerHeight),
-  };
-  const region = isMouseActive ? mouseRegion : settings.region;
-  const isReadingActive = isManualActive || isMouseActive;
-  const controlsBelow = region.y < 44;
-  const controlStyle: CSSProperties = isAutoActive || isMouseActive
-    ? { right: 18, top: 18 }
-    : {
-        left: Math.min(Math.max(8, region.x + region.width - 32), Math.max(8, window.innerWidth - 40)),
-        top: controlsBelow ? region.y + region.height + 8 : region.y - 38,
-      };
-  const popupWidth = Math.min(400, window.innerWidth - 24);
-  const popupHeight = Math.min(360, window.innerHeight - 24);
-  const belowTop = region.y + region.height + (controlsBelow ? 52 : 12);
+  const visibleSelection = draftSelection ?? selection;
+  const controlsBelow = selection ? selection.y < 44 : false;
+  const popupWidth = Math.min(440, window.innerWidth - 24);
+  const popupHeight = Math.min(520, window.innerHeight - 24);
+  const belowTop = selection ? selection.y + selection.height + (controlsBelow ? 52 : 12) : 12;
   const roomBelow = window.innerHeight - belowTop - 12;
-  const roomAbove = region.y - 24;
-  const placeBelow = roomBelow >= Math.min(220, popupHeight) || roomBelow >= roomAbove;
-  const availableHeight = Math.max(120, Math.min(popupHeight, placeBelow ? roomBelow : roomAbove));
-  const popupTop = placeBelow ? belowTop : Math.max(12, region.y - availableHeight - 12);
+  const roomAbove = selection ? selection.y - 24 : 0;
+  const placeBelow = roomBelow >= Math.min(260, popupHeight) || roomBelow >= roomAbove;
+  const availableHeight = Math.max(140, Math.min(popupHeight, placeBelow ? roomBelow : roomAbove));
+  const popupTop = selection && !placeBelow
+    ? Math.max(12, selection.y - availableHeight - 12)
+    : belowTop;
   const findingStyle: CSSProperties = {
-    left: Math.min(Math.max(12, region.x), Math.max(12, window.innerWidth - popupWidth - 12)),
+    left: selection
+      ? Math.min(Math.max(12, selection.x), Math.max(12, window.innerWidth - popupWidth - 12))
+      : 12,
     top: popupTop,
     width: popupWidth,
     maxHeight: availableHeight,
   };
+
   return (
     <div
-      className={`overlay-surface ${mode === "edit" ? "is-editing" : ""} ${isMouseActive ? "is-mouse" : ""}`}
-      onPointerMove={movePointer}
-      onPointerUp={finishDrag}
-      onPointerCancel={finishDrag}
+      className={`overlay-surface ${isMouseActive ? "is-mouse" : ""} ${isSelecting ? "is-selecting" : ""}`}
+      onPointerDown={startSelection}
+      onPointerMove={moveSelection}
+      onPointerUp={finishSelection}
+      onPointerCancel={finishSelection}
     >
-      {!isAutoActive && !isMouseActive && (
-        <div
-          className="overlay-region"
-          style={{ left: region.x, top: region.y, width: region.width, height: region.height }}
-          onPointerDown={(event) => startDrag(event, "move")}
-        >
-          <span className="overlay-label">Manual area</span>
-          {mode === "edit" && (["nw", "ne", "sw", "se"] as DragAction[]).map((action) => (
-            <span
-              className={`resize-handle handle-${action}`}
-              key={action}
-              onPointerDown={(event) => startDrag(event, action)}
-            />
-          ))}
-        </div>
+      {isMouseActive && !selection && !isSelecting && (
+        <div className="overlay-help">Click and drag around the text you want to isolate</div>
       )}
-      {isMouseActive && (
+      {isMouseActive && visibleSelection && (isSelecting || isolationBordersVisible) && (
         <div
           className="mouse-capture-region"
-          style={{ left: region.x, top: region.y, width: region.width, height: region.height }}
+          style={{
+            left: visibleSelection.x,
+            top: visibleSelection.y,
+            width: visibleSelection.width,
+            height: visibleSelection.height,
+          }}
         >
-          <span className="overlay-label">Mouse 240×120</span>
+          <span className="overlay-label">
+            {isSelecting ? "Selecting" : "Selected"} {visibleSelection.width}×{visibleSelection.height}
+          </span>
         </div>
       )}
-      {isAutoActive && autoBordersVisible && finding?.detectedLines.map((line, index) => (
+      {(isAutoActive || isMouseActive) && isolationBordersVisible && finding?.detectedLines.map((line, index) => (
         <div
           className="auto-detected-line"
           key={`${index}-${line.x}-${line.y}-${line.width}-${line.height}`}
@@ -238,10 +166,10 @@ export default function Overlay() {
       ))}
       {isActive && (
         <button
-          aria-label="Stop OCR and return to wis"
+          aria-label="Stop isolation and return to wis"
           className="overlay-close"
           disabled={isStopping}
-          style={controlStyle}
+          style={{ right: 18, top: 18 }}
           type="button"
           onPointerDown={(event) => event.stopPropagation()}
           onClick={closeCapture}
@@ -249,53 +177,63 @@ export default function Overlay() {
           ×
         </button>
       )}
-      {isReadingActive && (
+      {isMouseActive && selection && !isSelecting && (
         <div
           aria-live="polite"
-          className={`overlay-finding ${finding?.error ? "has-error" : ""}`}
+          className={`overlay-finding ${finding?.error || selectionError ? "has-error" : ""}`}
           style={findingStyle}
-          tabIndex={0}
           onPointerDown={(event) => event.stopPropagation()}
         >
           <div className="overlay-finding-heading">
-            <span>{finding ? "Latest finding" : "Looking…"}</span>
-            {finding && !finding.error && <small>{finding.confidence}%</small>}
+            <span>{finding ? "Isolation pipeline" : "Processing selection…"}</span>
+            {finding && !finding.error && <small>{finding.detectedLines.length} regions</small>}
           </div>
-          {finding?.previewImageDataUrl && (
-            <figure className="overlay-preview">
-              <img src={finding.previewImageDataUrl} alt="Latest image sent to OCR" />
-              <figcaption>OCR input</figcaption>
-            </figure>
+          {finding?.isolationSteps.length ? (
+            <div className="isolation-steps">
+              {finding.isolationSteps.map((step, index) => (
+                <figure className="overlay-preview" key={`${index}-${step.name}`}>
+                  <img src={step.previewImageDataUrl} alt={`Isolation stage: ${step.name}`} />
+                  <figcaption>
+                    <span>{step.name}</span>
+                    {step.elapsedMicros !== null && <small>{formatDuration(step.elapsedMicros)}</small>}
+                  </figcaption>
+                </figure>
+              ))}
+            </div>
+          ) : null}
+          <p>
+            {selectionError
+              || finding?.error
+              || (finding ? `${finding.detectedLines.length} text-like regions found` : "Waiting for this selection")}
+          </p>
+          {finding && (
+            <small>{formatDuration(finding.elapsedMicros)} total · {new Date(finding.observedAtMs).toLocaleTimeString()}</small>
           )}
-          <p>{finding?.error || finding?.text || (finding ? "No text found" : "Waiting for the first scan")}</p>
-          {finding && <small>{finding.elapsedMs}ms · {new Date(finding.observedAtMs).toLocaleTimeString()}</small>}
         </div>
       )}
     </div>
   );
 }
 
-function mouseAxisStart(position: number, size: number, screenSize: number): number {
-  if (screenSize <= size) return 0;
-  if (position + size <= screenSize) return position;
-  return Math.max(0, position - size);
+function clampPoint(x: number, y: number) {
+  return {
+    x: Math.round(Math.max(0, Math.min(window.innerWidth, x))),
+    y: Math.round(Math.max(0, Math.min(window.innerHeight, y))),
+  };
 }
 
-function resizeRegion(initial: Region, action: DragAction, deltaX: number, deltaY: number): Region {
-  if (action === "move") {
-    return {
-      ...initial,
-      x: Math.max(0, initial.x + deltaX),
-      y: Math.max(0, initial.y + deltaY),
-    };
-  }
-  let left = initial.x;
-  let top = initial.y;
-  let right = initial.x + initial.width;
-  let bottom = initial.y + initial.height;
-  if (action.includes("n")) top = Math.min(bottom - minimumSize, Math.max(0, top + deltaY));
-  if (action.includes("s")) bottom = Math.max(top + minimumSize, bottom + deltaY);
-  if (action.includes("w")) left = Math.min(right - minimumSize, Math.max(0, left + deltaX));
-  if (action.includes("e")) right = Math.max(left + minimumSize, right + deltaX);
-  return { x: left, y: top, width: right - left, height: bottom - top };
+function regionBetween(startX: number, startY: number, endX: number, endY: number): Region {
+  return {
+    x: Math.min(startX, endX),
+    y: Math.min(startY, endY),
+    width: Math.max(1, Math.abs(endX - startX)),
+    height: Math.max(1, Math.abs(endY - startY)),
+  };
+}
+
+function formatDuration(micros: number): string {
+  if (micros < 1) return "<1µs";
+  if (micros < 1_000) return `${Math.round(micros)}µs`;
+  if (micros < 10_000) return `${(micros / 1_000).toFixed(2)}ms`;
+  return `${(micros / 1_000).toFixed(1)}ms`;
 }

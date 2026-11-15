@@ -109,9 +109,11 @@ html[data-window="overlay"] body::before { display: none; }
 .overlay-finding:focus { outline: 2px solid rgba(181, 255, 114, 0.6); outline-offset: 2px; }
 .overlay-finding-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #b5ff72; font-size: 10px; font-weight: 850; letter-spacing: 0.1em; text-transform: uppercase; }
 .overlay-finding-heading small { color: #899188; font-size: 10px; }
-.overlay-preview { position: relative; display: grid; place-items: center; min-height: 68px; margin: 11px 0 0; border: 1px solid #313831; border-radius: 6px; background: #f6f6f3; overflow: hidden; }
-.overlay-preview img { display: block; width: 100%; max-height: 124px; object-fit: contain; image-rendering: auto; }
-.overlay-preview figcaption { position: absolute; right: 5px; bottom: 5px; padding: 2px 5px; color: #b8c0b8; border-radius: 3px; background: rgba(12, 15, 13, 0.82); font-size: 8px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.overlay-preview { display: flex; flex-direction: column; margin: 0; border: 1px solid #313831; border-radius: 6px; background: #f6f6f3; overflow: hidden; }
+.overlay-preview img { display: block; width: 100%; height: auto; object-fit: contain; image-rendering: auto; }
+.overlay-preview figcaption { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 9px; color: #b8c0b8; background: #101411; font-size: 9px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.overlay-preview figcaption small { color: #7f887f; font-size: inherit; }
+.isolation-steps { display: flex; flex-direction: column; gap: 10px; margin-top: 11px; }
 .overlay-finding p { flex: 0 0 auto; margin: 11px 0 8px; color: #edf2ec; font: 600 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .overlay-finding > small { color: #717a72; font-size: 10px; }
 .overlay-finding.has-error { border-color: rgba(255, 125, 106, 0.5); }

@@ -1,16 +1,16 @@
 # wis — what i see
 
-`wis` is a small Linux-first screen-recognition proof of concept. Use one resizable Manual area, follow the pointer with Mouse OCR, or let Auto mode outline text lines across the captured screen.
+`wis` is a small Linux-first screen-recognition proof of concept. Follow the pointer with Mouse isolation, or let Auto mode outline text-like regions across the captured screen.
 
 ## What it does
 
-- Manual mode with one draggable, resizable OCR area and live findings.
-- Mouse mode with a 240×120 OCR area anchored beside the pointer.
+- Mouse mode with a click-drag-release isolation area of any size.
 - Auto mode with thin outlines around detected text lines across the screen.
-- Persistent area coordinates and scan interval.
+- One shared text-isolation pipeline for Mouse and Auto; only their search bounds differ.
+- Mouse-only previews of every retained isolation stage.
+- Persistent scan interval.
 - Wayland screen capture through the XDG ScreenCast portal and PipeWire.
-- Periodic OpenCV preprocessing and Tesseract OCR.
-- Expandable live overlay finding with confidence, recognition time, and a thumbnail of the processed image sent to OCR.
+- Periodic OpenCV text isolation with retained Mouse-mode debug stages.
 - One-click × control to stop capture and return to the main window.
 - No input automation and no application-specific recognition rules.
 
@@ -24,7 +24,7 @@ chmod +x setup-bazzite.sh
 yarn dev
 ```
 
-Choose **Start manual** to position one OCR area, **Start mouse** to read a 240×120 area beside the pointer, or **Start auto** to detect text lines across the screen. All modes use the configured **Look every** interval and open the system screen-selection dialog. Manual and Mouse findings include the latest processed thumbnail.
+Choose **Start mouse**, then click-drag-release around a screen area to isolate it once. Choose **Start auto** to detect text lines across the whole screen at the configured **Look every** interval. Mouse mode keeps a full-width preview of every internal isolation stage for debugging; Auto runs the same stages without retaining them.
 
 ## Architecture
 
