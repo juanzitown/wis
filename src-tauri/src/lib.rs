@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use leptess::{LepTess, Variable};
 use scrcap::{CaptureConfig, CaptureDescriptor as _, Target, VideoConfig};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
@@ -119,6 +120,18 @@ struct OcrUpdate {
     logical_height: u32,
     detected_lines: Vec<text_isolation::DetectedLine>,
     isolation_steps: Vec<text_isolation::IsolationStep>,
+    recognized_lines: Vec<RecognizedLine>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecognizedLine {
+    region: text_isolation::DetectedLine,
+    text: String,
+    confidence: i32,
+    preview_image_data_url: Option<String>,
+    elapsed_micros: u128,
     error: Option<String>,
 }
 
@@ -163,6 +176,17 @@ fn submit_mouse_region(region: Region, state: State<'_, AppState>) -> Result<u64
         .lock()
         .map_err(|_| "mouse selection lock was poisoned".to_owned())?;
     selection.region = Some(region);
+    selection.revision = selection.revision.wrapping_add(1).max(1);
+    Ok(selection.revision)
+}
+
+#[tauri::command]
+fn clear_mouse_region(state: State<'_, AppState>) -> Result<u64, String> {
+    let mut selection = state
+        .mouse_selection
+        .lock()
+        .map_err(|_| "mouse selection lock was poisoned".to_owned())?;
+    selection.region = None;
     selection.revision = selection.revision.wrapping_add(1).max(1);
     Ok(selection.revision)
 }
@@ -337,6 +361,16 @@ fn run_capture(
     stop: Arc<AtomicBool>,
     mode: CaptureMode,
 ) -> Result<(), String> {
+    let mut tesseract = if mode == CaptureMode::Mouse {
+        let mut engine = LepTess::new(None, "eng")
+            .map_err(|error| format!("could not initialize Tesseract English OCR: {error}"))?;
+        engine
+            .set_variable(Variable::TesseditPagesegMode, "7")
+            .map_err(|_| "could not configure Tesseract for single-line OCR".to_owned())?;
+        Some(engine)
+    } else {
+        None
+    };
     let capture = CaptureConfig {
         video: VideoConfig {
             channel_capacity: 2,
@@ -415,6 +449,16 @@ fn run_capture(
         let pending = pending_isolation
             .take()
             .expect("a settled isolation must have pending bounds");
+        if let Some(revision) = pending.mouse_revision {
+            let selection = *app
+                .state::<AppState>()
+                .mouse_selection
+                .lock()
+                .map_err(|_| "mouse selection lock was poisoned".to_owned())?;
+            if selection.revision != revision || selection.region != Some(pending.region) {
+                continue;
+            }
+        }
         last_scan = Instant::now();
         let started = Instant::now();
         let (preview_image_data_url, detected_lines, isolation_steps, error) =
@@ -434,6 +478,39 @@ fn run_capture(
                 }
                 Err(error) => (None, Vec::new(), Vec::new(), Some(error)),
             };
+        let recognized_lines = if error.is_none() && mode == CaptureMode::Mouse {
+            recognize_isolated_lines(
+                tesseract
+                    .as_mut()
+                    .expect("Mouse capture always initializes Tesseract"),
+                &frame.vframe,
+                frame.size,
+                logical_size,
+                &detected_lines,
+            )
+        } else {
+            Vec::new()
+        };
+        let recognized_text = recognized_lines
+            .iter()
+            .map(|line| line.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let confident_lines = recognized_lines
+            .iter()
+            .filter(|line| line.error.is_none() && !line.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let confidence = if confident_lines.is_empty() {
+            0
+        } else {
+            confident_lines
+                .iter()
+                .map(|line| line.confidence as i64)
+                .sum::<i64>()
+                .checked_div(confident_lines.len() as i64)
+                .unwrap_or_default() as i32
+        };
         if let Some(revision) = pending.mouse_revision {
             last_mouse_revision = revision;
         }
@@ -442,8 +519,8 @@ fn run_capture(
             "ocr-update",
             OcrUpdate {
                 mode: mode.as_str(),
-                text: String::new(),
-                confidence: 0,
+                text: recognized_text,
+                confidence,
                 preview_image_data_url,
                 elapsed_ms: elapsed.as_millis(),
                 elapsed_micros: elapsed.as_micros(),
@@ -457,6 +534,7 @@ fn run_capture(
                 logical_height: logical_size.1,
                 detected_lines,
                 isolation_steps,
+                recognized_lines,
                 error,
             },
         )
@@ -464,6 +542,42 @@ fn run_capture(
     }
     capture.terminate();
     Ok(())
+}
+
+fn recognize_isolated_lines(
+    tesseract: &mut LepTess,
+    frame: &[u8],
+    frame_size: (u32, u32),
+    logical_size: (u32, u32),
+    lines: &[text_isolation::DetectedLine],
+) -> Vec<RecognizedLine> {
+    lines
+        .iter()
+        .take(64)
+        .map(|line| {
+            let started = Instant::now();
+            let (text, confidence, preview_image_data_url, error) = text_clarity::recognize_region(
+                tesseract,
+                frame,
+                frame_size,
+                logical_size,
+                Region {
+                    x: line.x,
+                    y: line.y,
+                    width: line.width,
+                    height: line.height,
+                },
+            );
+            RecognizedLine {
+                region: line.clone(),
+                text,
+                confidence,
+                preview_image_data_url,
+                elapsed_micros: started.elapsed().as_micros(),
+                error,
+            }
+        })
+        .collect()
 }
 
 fn overlay_dimensions(app: &tauri::AppHandle) -> Option<(u32, u32)> {
@@ -534,6 +648,7 @@ pub fn run() {
             get_settings,
             save_settings,
             submit_mouse_region,
+            clear_mouse_region,
             get_overlay_mode,
             set_overlay_mode,
             get_runtime_status,

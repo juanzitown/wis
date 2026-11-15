@@ -342,7 +342,10 @@ fn find_glyph_candidates(mut ctx: IsolationContext) -> Result<IsolationContext, 
         }
         let global_x = ctx.crop_origin.0.saturating_add(rect.x.max(0) as u32);
         let global_y = ctx.crop_origin.1.saturating_add(rect.y.max(0) as u32);
-        if global_x > ctx.frame_size.0.saturating_sub(80) && global_y < 80 {
+        let global_right = global_x.saturating_add(rect.width.max(0) as u32);
+        let stop_left = ctx.frame_size.0.saturating_div(2).saturating_sub(72);
+        let stop_right = ctx.frame_size.0.saturating_div(2).saturating_add(72);
+        if global_y < 64 && global_right > stop_left && global_x < stop_right {
             continue;
         }
         ctx.candidates.push(rect);

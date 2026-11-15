@@ -1,6 +1,7 @@
 import { CSSProperties, PointerEvent, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  clearMouseRegion,
   getRuntimeStatus,
   OcrUpdate,
   Region,
@@ -60,6 +61,18 @@ export default function Overlay() {
   const isAutoActive = isActive && status?.mode === "auto";
   const isMouseActive = isActive && status?.mode === "mouse";
 
+  useEffect(() => {
+    if (!isActive) return;
+    function stopOnEscape(event: KeyboardEvent) {
+      if (event.key !== "Escape" || event.repeat) return;
+      event.preventDefault();
+      setIsStopping(true);
+      stopOcr().catch(() => setIsStopping(false));
+    }
+    window.addEventListener("keydown", stopOnEscape);
+    return () => window.removeEventListener("keydown", stopOnEscape);
+  }, [isActive]);
+
   function startSelection(event: PointerEvent<HTMLDivElement>) {
     if (!isMouseActive || event.button !== 0) return;
     event.preventDefault();
@@ -110,6 +123,21 @@ export default function Overlay() {
     }
   }
 
+  async function clearSelection() {
+    dragRef.current = null;
+    setSelection(null);
+    setDraftSelection(null);
+    setFinding(null);
+    setSelectionError(null);
+    setIsSelecting(false);
+    setIsolationBordersVisible(false);
+    try {
+      await clearMouseRegion();
+    } catch (error) {
+      setSelectionError(String(error));
+    }
+  }
+
   const visibleSelection = draftSelection ?? selection;
   const controlsBelow = selection ? selection.y < 44 : false;
   const popupWidth = Math.min(440, window.innerWidth - 24);
@@ -130,6 +158,14 @@ export default function Overlay() {
     width: popupWidth,
     maxHeight: availableHeight,
   };
+  const cropResetStyle: CSSProperties | undefined = selection
+    ? {
+        left: selection.x + selection.width + 8 <= window.innerWidth - 28
+          ? selection.x + selection.width + 8
+          : Math.max(4, selection.x - 34),
+        top: Math.min(Math.max(4, selection.y), Math.max(4, window.innerHeight - 32)),
+      }
+    : undefined;
 
   return (
     <div
@@ -157,7 +193,7 @@ export default function Overlay() {
           </span>
         </div>
       )}
-      {(isAutoActive || isMouseActive) && isolationBordersVisible && finding?.detectedLines.map((line, index) => (
+      {(isAutoActive || (isMouseActive && selection)) && isolationBordersVisible && finding?.detectedLines.map((line, index) => (
         <div
           className="auto-detected-line"
           key={`${index}-${line.x}-${line.y}-${line.width}-${line.height}`}
@@ -167,12 +203,24 @@ export default function Overlay() {
       {isActive && (
         <button
           aria-label="Stop isolation and return to wis"
-          className="overlay-close"
+          className="overlay-stop"
           disabled={isStopping}
-          style={{ right: 18, top: 18 }}
           type="button"
           onPointerDown={(event) => event.stopPropagation()}
           onClick={closeCapture}
+        >
+          <span aria-hidden="true">×</span>
+          Stop
+        </button>
+      )}
+      {isMouseActive && selection && (
+        <button
+          aria-label="Clear this crop and select another area"
+          className="crop-reset"
+          style={cropResetStyle}
+          type="button"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={clearSelection}
         >
           ×
         </button>
@@ -201,14 +249,33 @@ export default function Overlay() {
               ))}
             </div>
           ) : null}
-          <p>
-            {selectionError
-              || finding?.error
-              || (finding ? `${finding.detectedLines.length} text-like regions found` : "Waiting for this selection")}
-          </p>
-          {finding && (
-            <small>{formatDuration(finding.elapsedMicros)} total · {new Date(finding.observedAtMs).toLocaleTimeString()}</small>
+          {(selectionError || finding?.error) && (
+            <p>{selectionError || finding?.error}</p>
           )}
+          {finding && !finding.error && (
+            <section className="tesseract-result">
+              <header>
+                <span>Tesseract result</span>
+                <small>{finding.confidence}% average confidence</small>
+              </header>
+              <pre>{finding.text || "No text recognized"}</pre>
+              {finding.recognizedLines.map((line, index) => (
+                <figure className="overlay-preview" key={`ocr-${index}-${line.region.x}-${line.region.y}`}>
+                  {line.previewImageDataUrl && (
+                    <img src={line.previewImageDataUrl} alt={`Tesseract input for isolated line ${index + 1}`} />
+                  )}
+                  <figcaption>
+                    <span>Line {index + 1} · {line.error || line.text || "No text"}</span>
+                    <small>{line.confidence}% · {formatDuration(line.elapsedMicros)}</small>
+                  </figcaption>
+                </figure>
+              ))}
+              <footer>
+                {formatDuration(finding.elapsedMicros)} total · {new Date(finding.observedAtMs).toLocaleTimeString()}
+              </footer>
+            </section>
+          )}
+          {!finding && !selectionError && <p>Waiting for this selection</p>}
         </div>
       )}
     </div>

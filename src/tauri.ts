@@ -21,6 +21,15 @@ export type IsolationStep = {
   elapsedMicros: number | null;
 };
 
+export type RecognizedLine = {
+  region: Region;
+  text: string;
+  confidence: number;
+  previewImageDataUrl: string | null;
+  elapsedMicros: number;
+  error: string | null;
+};
+
 export type RuntimeStatus = {
   platform: string;
   sessionType: string;
@@ -46,6 +55,7 @@ export type OcrUpdate = {
   logicalHeight: number;
   detectedLines: Region[];
   isolationSteps: IsolationStep[];
+  recognizedLines: RecognizedLine[];
   error: string | null;
 };
 
@@ -100,6 +110,10 @@ export function submitMouseRegion(region: Region) {
       height: Math.round(region.height),
     },
   });
+}
+
+export function clearMouseRegion() {
+  return invoke<number>("clear_mouse_region");
 }
 
 export async function getOverlayMode(): Promise<OverlayMode> {

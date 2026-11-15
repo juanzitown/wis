@@ -4,6 +4,8 @@ Features
 - [x] add one-shot click-drag-release Mouse isolation with a persistent selection border
 - [x] remove Manual mode and share text isolation between Mouse and Auto
 - [x] retain named isolation-stage previews only for Mouse mode
+- [x] run Tesseract per isolated Mouse line and append the result to the pipeline popup
+- [x] separate Stop/Escape from crop reset so Mouse can reselect without restarting sharing
 - [ ] detect and process complete text lines
   - [x] converge Mouse and Auto on the same text-isolation pipeline
   - [x] group glyph fragments horizontally without merging neighboring rows

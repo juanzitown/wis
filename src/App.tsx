@@ -155,10 +155,10 @@ export default function App() {
             ) : latest.error ? (
               <p>{latest.error}</p>
             ) : (
-              <pre>{latest.detectedLines.length} text-like region{latest.detectedLines.length === 1 ? "" : "s"} found</pre>
+              <pre>{latest.text || "No text recognized"}</pre>
             )}
             {latest && !latest.error && (
-              <small>{latest.isolationSteps.length} retained steps · {formatDuration(latest.elapsedMicros)}</small>
+              <small>{latest.confidence}% confidence · {latest.detectedLines.length} isolated lines · {formatDuration(latest.elapsedMicros)}</small>
             )}
           </div>
 
@@ -170,8 +170,8 @@ export default function App() {
             {findings.slice(1).map((finding) => (
               <div className="history-item" key={`${finding.observedAtMs}-${finding.elapsedMs}`}>
                 <time>{new Date(finding.observedAtMs).toLocaleTimeString()}</time>
-                <p>{finding.error || `${finding.detectedLines.length} text-like regions`}</p>
-                <span>{finding.error ? "error" : formatDuration(finding.elapsedMicros)}</span>
+                <p>{finding.error || finding.text || "No text recognized"}</p>
+                <span>{finding.error ? "error" : `${finding.confidence}%`}</span>
               </div>
             ))}
           </div>
