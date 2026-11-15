@@ -88,7 +88,7 @@ html[data-window="overlay"] body::before { display: none; }
 .overlay-surface.is-editing { pointer-events: none; }
 .overlay-region { position: absolute; border: 0; outline: 2px solid #b5ff72; background: transparent; box-shadow: 0 0 14px rgba(181, 255, 114, 0.42); pointer-events: none; touch-action: none; }
 .overlay-surface.is-editing .overlay-region { pointer-events: auto; cursor: move; }
-.auto-detected-block { position: absolute; border: 0; outline: 1px solid rgba(117, 207, 255, 0.92); box-shadow: 0 0 5px rgba(117, 207, 255, 0.36); pointer-events: none; }
+.auto-detected-line { position: absolute; border: 0; outline: 1px solid rgba(117, 207, 255, 0.92); box-shadow: 0 0 5px rgba(117, 207, 255, 0.36); pointer-events: none; }
 .overlay-label { position: absolute; left: -2px; bottom: calc(100% + 7px); padding: 4px 7px; color: #10150f; background: #b5ff72; font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.08em; }
 .resize-handle { position: absolute; width: 12px; height: 12px; border: 2px solid #10150f; background: #b5ff72; }
 .handle-nw { left: -15px; top: -15px; cursor: nwse-resize; }

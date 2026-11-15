@@ -37,7 +37,7 @@ export type OcrUpdate = {
   captureHeight: number;
   logicalWidth: number;
   logicalHeight: number;
-  detectedBlocks: Region[];
+  detectedLines: Region[];
   error: string | null;
 };
 

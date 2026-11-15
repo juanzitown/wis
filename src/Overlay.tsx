@@ -29,6 +29,7 @@ export default function Overlay() {
   const [mode, setMode] = useState<OverlayMode>("hidden");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [finding, setFinding] = useState<OcrUpdate | null>(null);
+  const [autoBordersVisible, setAutoBordersVisible] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const settingsRef = useRef(settings);
   const dragRef = useRef<DragState | null>(null);
@@ -52,17 +53,25 @@ export default function Overlay() {
     });
     const statusSubscription = listen<RuntimeStatus>("ocr-status", (event) => {
       setStatus(event.payload);
-      if (event.payload.phase === "starting") setFinding(null);
+      if (event.payload.phase === "starting") {
+        setFinding(null);
+        setAutoBordersVisible(false);
+      }
       if (event.payload.phase === "idle") setIsStopping(false);
     });
     const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
       setFinding(event.payload);
+      if (event.payload.mode === "auto") setAutoBordersVisible(true);
+    });
+    const autoVisibilitySubscription = listen<boolean>("auto-borders-visible", (event) => {
+      setAutoBordersVisible(event.payload);
     });
     return () => {
       settingsSubscription.then((unlisten) => unlisten());
       modeSubscription.then((unlisten) => unlisten());
       statusSubscription.then((unlisten) => unlisten());
       ocrSubscription.then((unlisten) => unlisten());
+      autoVisibilitySubscription.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -155,11 +164,11 @@ export default function Overlay() {
           ))}
         </div>
       )}
-      {isAutoActive && finding?.detectedBlocks.map((block, index) => (
+      {isAutoActive && autoBordersVisible && finding?.detectedLines.map((line, index) => (
         <div
-          className="auto-detected-block"
-          key={`${index}-${block.x}-${block.y}-${block.width}-${block.height}`}
-          style={{ left: block.x, top: block.y, width: block.width, height: block.height }}
+          className="auto-detected-line"
+          key={`${index}-${line.x}-${line.y}-${line.width}-${line.height}`}
+          style={{ left: line.x, top: line.y, width: line.width, height: line.height }}
         />
       ))}
       {isActive && (

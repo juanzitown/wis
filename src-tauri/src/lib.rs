@@ -95,7 +95,7 @@ struct RuntimeStatus {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DetectedBlock {
+struct DetectedLine {
     x: u32,
     y: u32,
     width: u32,
@@ -115,7 +115,7 @@ struct OcrUpdate {
     capture_height: u32,
     logical_width: u32,
     logical_height: u32,
-    detected_blocks: Vec<DetectedBlock>,
+    detected_lines: Vec<DetectedLine>,
     error: Option<String>,
 }
 
@@ -332,6 +332,7 @@ fn run_capture(
 
     set_capture_running(&app, capture.size());
     let mut last_scan = Instant::now() - Duration::from_secs(60);
+    let mut auto_settle_started: Option<Instant> = None;
     while !stop.load(Ordering::Acquire) {
         let frame = capture
             .video()
@@ -343,13 +344,30 @@ fn run_capture(
             .lock()
             .map_err(|_| "settings lock was poisoned".to_owned())?
             .clone();
-        if last_scan.elapsed() < Duration::from_millis(settings.scan_interval_ms) {
+        if mode == CaptureMode::Auto {
+            if let Some(started) = auto_settle_started {
+                // At 10 fps this discards at least one complete frame after
+                // the WebView removes its old borders from the compositor.
+                if started.elapsed() < Duration::from_millis(160) {
+                    continue;
+                }
+            } else {
+                if last_scan.elapsed() < Duration::from_millis(settings.scan_interval_ms) {
+                    continue;
+                }
+                app.emit_to("overlay", "auto-borders-visible", false)
+                    .map_err(|error| error.to_string())?;
+                auto_settle_started = Some(Instant::now());
+                continue;
+            }
+        } else if last_scan.elapsed() < Duration::from_millis(settings.scan_interval_ms) {
             continue;
         }
         last_scan = Instant::now();
+        auto_settle_started = None;
         let logical_size = overlay_dimensions(&app).unwrap_or(frame.size);
         let started = Instant::now();
-        let (text, confidence, preview_image_data_url, detected_blocks, error) = match mode {
+        let (text, confidence, preview_image_data_url, detected_lines, error) = match mode {
             CaptureMode::Manual => {
                 let (text, confidence, preview, error) = recognize_region(
                     tesseract
@@ -362,12 +380,10 @@ fn run_capture(
                 );
                 (text, confidence, preview, Vec::new(), error)
             }
-            CaptureMode::Auto => {
-                match detect_text_blocks(&frame.vframe, frame.size, logical_size) {
-                    Ok(blocks) => (String::new(), 0, None, blocks, None),
-                    Err(error) => (String::new(), 0, None, Vec::new(), Some(error)),
-                }
-            }
+            CaptureMode::Auto => match detect_text_lines(&frame.vframe, frame.size, logical_size) {
+                Ok(lines) => (String::new(), 0, None, lines, None),
+                Err(error) => (String::new(), 0, None, Vec::new(), Some(error)),
+            },
         };
         app.emit(
             "ocr-update",
@@ -385,7 +401,7 @@ fn run_capture(
                 capture_height: frame.size.1,
                 logical_width: logical_size.0,
                 logical_height: logical_size.1,
-                detected_blocks,
+                detected_lines,
                 error,
             },
         )
@@ -395,11 +411,11 @@ fn run_capture(
     Ok(())
 }
 
-fn detect_text_blocks(
+fn detect_text_lines(
     frame: &[u8],
     frame_size: (u32, u32),
     logical_size: (u32, u32),
-) -> Result<Vec<DetectedBlock>, String> {
+) -> Result<Vec<DetectedLine>, String> {
     let (frame_width, frame_height) = frame_size;
     let (logical_width, logical_height) = logical_size;
     if frame_width == 0 || frame_height == 0 || logical_width == 0 || logical_height == 0 {
@@ -417,30 +433,47 @@ fn detect_text_blocks(
     let source = source
         .reshape(4, frame_height as i32)
         .map_err(|error| error.to_string())?;
-    let mut gray = Mat::default();
-    imgproc::cvt_color_def(&source, &mut gray, imgproc::COLOR_BGRA2GRAY)
+    let mut bgr = Mat::default();
+    imgproc::cvt_color_def(&source, &mut bgr, imgproc::COLOR_BGRA2BGR)
         .map_err(|error| error.to_string())?;
 
-    // The morphological gradient reacts to light, dark, and colored glyph
-    // edges. Closing with a wide, short kernel joins nearby characters into
-    // line-like blocks without merging unrelated rows of text.
+    // Smooth tiny texture/color fluctuations, then keep the strongest glyph
+    // edge found in any B, G, or R channel. Looking at channels separately
+    // retains colored text that can nearly disappear after grayscale mixing.
     let edge_kernel =
         imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(3, 3), Point::new(-1, -1))
             .map_err(|error| error.to_string())?;
     let mut gradient = Mat::default();
-    imgproc::morphology_ex(
-        &gray,
-        &mut gradient,
-        imgproc::MORPH_GRADIENT,
-        &edge_kernel,
-        Point::new(-1, -1),
-        1,
-        core::BORDER_CONSTANT,
-        Scalar::all(0.0),
-    )
-    .map_err(|error| error.to_string())?;
+    for channel_index in 0..3 {
+        let mut channel = Mat::default();
+        core::extract_channel(&bgr, &mut channel, channel_index)
+            .map_err(|error| error.to_string())?;
+        let mut smoothed = Mat::default();
+        imgproc::gaussian_blur_def(&channel, &mut smoothed, Size::new(3, 3), 0.0)
+            .map_err(|error| error.to_string())?;
+        let mut channel_gradient = Mat::default();
+        imgproc::morphology_ex(
+            &smoothed,
+            &mut channel_gradient,
+            imgproc::MORPH_GRADIENT,
+            &edge_kernel,
+            Point::new(-1, -1),
+            1,
+            core::BORDER_CONSTANT,
+            Scalar::all(0.0),
+        )
+        .map_err(|error| error.to_string())?;
+        if channel_index == 0 {
+            gradient = channel_gradient;
+        } else {
+            let mut combined = Mat::default();
+            core::max(&gradient, &channel_gradient, &mut combined)
+                .map_err(|error| error.to_string())?;
+            gradient = combined;
+        }
+    }
     let mut edges = Mat::default();
-    imgproc::threshold(
+    let otsu_threshold = imgproc::threshold(
         &gradient,
         &mut edges,
         0.0,
@@ -448,12 +481,30 @@ fn detect_text_blocks(
         imgproc::THRESH_BINARY | imgproc::THRESH_OTSU,
     )
     .map_err(|error| error.to_string())?;
+    // Otsu is screen-global and can be biased upward by a few very bright UI
+    // elements. Keep its adaptive baseline, but admit slightly weaker badge
+    // and colored-text edges into the candidate pass.
+    let relaxed_threshold = (otsu_threshold * 0.82).max(3.0);
+    imgproc::threshold(
+        &gradient,
+        &mut edges,
+        relaxed_threshold,
+        255.0,
+        imgproc::THRESH_BINARY,
+    )
+    .map_err(|error| error.to_string())?;
 
-    let kernel_width = ((frame_width / 120).clamp(9, 31) | 1) as i32;
-    let kernel_height = ((frame_height / 360).clamp(3, 7) | 1) as i32;
+    // Join neighboring glyphs only along X. A one-pixel-high kernel prevents
+    // adjacent rows from collapsing into a paragraph-sized block.
+    const MAX_LOGICAL_LINE_GAP: u32 = 12;
+    let maximum_line_gap = ((MAX_LOGICAL_LINE_GAP as u64 * frame_width as u64
+        + logical_width as u64 / 2)
+        / logical_width as u64)
+        .max(1) as i32;
+    let kernel_width = (maximum_line_gap.clamp(5, 17) | 1) as i32;
     let line_kernel = imgproc::get_structuring_element(
         imgproc::MORPH_RECT,
-        Size::new(kernel_width, kernel_height),
+        Size::new(kernel_width, 1),
         Point::new(-1, -1),
     )
     .map_err(|error| error.to_string())?;
@@ -464,7 +515,7 @@ fn detect_text_blocks(
         imgproc::MORPH_CLOSE,
         &line_kernel,
         Point::new(-1, -1),
-        2,
+        1,
         core::BORDER_CONSTANT,
         Scalar::all(0.0),
     )
@@ -483,18 +534,37 @@ fn detect_text_blocks(
     let scale = |value: u32, captured: u32, logical: u32| {
         ((value as u64 * logical as u64 + captured as u64 / 2) / captured as u64) as u32
     };
-    let maximum_height = (frame_height / 5).max(48) as i32;
-    let mut blocks = Vec::new();
+    let maximum_height = (frame_height / 8).max(32) as i32;
+    let mut candidates = Vec::new();
     for index in 0..contours.len() {
         let contour = contours.get(index).map_err(|error| error.to_string())?;
         let rect = imgproc::bounding_rect(&contour).map_err(|error| error.to_string())?;
         let area = rect.width.saturating_mul(rect.height);
-        if rect.width < 12
-            || rect.height < 6
-            || rect.height > maximum_height
-            || area < 120
-            || rect.width < rect.height / 2
-        {
+        if rect.width < 6 || rect.height < 4 || rect.height > maximum_height || area < 40 {
+            continue;
+        }
+        // Text has repeated internal edges and visible channel variation.
+        // Flat silhouettes tend to contribute only a sparse perimeter.
+        let edge_roi = Mat::roi(&edges, rect).map_err(|error| error.to_string())?;
+        let edge_density = core::count_non_zero(&edge_roi).map_err(|error| error.to_string())?
+            as f64
+            / area as f64;
+        let minimum_density = if area < 800 { 0.009 } else { 0.015 };
+        if edge_density < minimum_density || edge_density > 0.72 {
+            continue;
+        }
+        let color_roi = Mat::roi(&bgr, rect).map_err(|error| error.to_string())?;
+        let mut mean = Mat::default();
+        let mut deviation = Mat::default();
+        core::mean_std_dev(&color_roi, &mut mean, &mut deviation, &core::no_array())
+            .map_err(|error| error.to_string())?;
+        let strongest_deviation = deviation
+            .data_typed::<f64>()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .copied()
+            .fold(0.0, f64::max);
+        if strongest_deviation < 3.5 {
             continue;
         }
         // Ignore the overlay's stop button in Auto mode.
@@ -502,24 +572,30 @@ fn detect_text_blocks(
             continue;
         }
 
-        let left = rect.x.saturating_sub(3).max(0) as u32;
-        let top = rect.y.saturating_sub(3).max(0) as u32;
-        let right = (rect.x + rect.width + 3).max(0) as u32;
-        let bottom = (rect.y + rect.height + 3).max(0) as u32;
+        candidates.push(rect);
+    }
+
+    candidates.sort_by_key(|rect| (rect.y, rect.x));
+    let mut lines = Vec::new();
+    for rect in candidates {
+        let left = rect.x.saturating_sub(4).max(0) as u32;
+        let top = rect.y.saturating_sub(2).max(0) as u32;
+        let right = (rect.x + rect.width + 4).max(0) as u32;
+        let bottom = (rect.y + rect.height + 2).max(0) as u32;
         let x = scale(left.min(frame_width), frame_width, logical_width);
         let y = scale(top.min(frame_height), frame_height, logical_height);
         let scaled_right = scale(right.min(frame_width), frame_width, logical_width);
         let scaled_bottom = scale(bottom.min(frame_height), frame_height, logical_height);
-        blocks.push(DetectedBlock {
+        lines.push(DetectedLine {
             x,
             y,
             width: scaled_right.saturating_sub(x).max(1),
             height: scaled_bottom.saturating_sub(y).max(1),
         });
     }
-    blocks.sort_by_key(|block| (block.y / 8, block.x));
-    blocks.truncate(128);
-    Ok(blocks)
+    lines.sort_by_key(|line| (line.y, line.x));
+    lines.truncate(256);
+    Ok(lines)
 }
 
 fn recognize_region(

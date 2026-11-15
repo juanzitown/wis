@@ -56,7 +56,7 @@ export default function App() {
       ([loadedSettings, loadedStatus]) => {
         setSettings(loadedSettings);
         setStatus(loadedStatus);
-        setMessage("Choose manual OCR or automatic text-block detection.");
+        setMessage("Choose manual OCR or automatic text-line detection.");
       },
     );
     const settingsSubscription = listen<WisSettings>("settings-changed", (event) => {
@@ -107,7 +107,7 @@ export default function App() {
       setMessage(
         mode === "manual"
           ? "Manual OCR is active. Drag or resize the area on screen."
-          : "Auto detection is scanning the screen for text blocks.",
+          : "Auto detection is scanning the screen for text lines.",
       );
     } catch (error) {
       setMessage(String(error));
@@ -132,7 +132,7 @@ export default function App() {
         <div>
           <p className="wordmark">wis <span>/ what i see</span></p>
           <h1>Watch a piece of your screen.</h1>
-          <p className="lede">Read one area manually, or let wis outline every text block it can find.</p>
+          <p className="lede">Read one area manually, or let wis outline every text line it can find.</p>
         </div>
         <div className={`runtime-badge ${status?.running ? "is-running" : ""}`}>
           <span />
