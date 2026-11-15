@@ -13,7 +13,7 @@ export type WisSettings = {
 };
 
 export type OverlayMode = "hidden" | "edit" | "preview";
-export type CaptureMode = "manual" | "auto";
+export type CaptureMode = "manual" | "auto" | "mouse";
 
 export type RuntimeStatus = {
   platform: string;
@@ -81,6 +81,10 @@ export function startOcr(mode: CaptureMode) {
 
 export function stopOcr() {
   return invoke<RuntimeStatus>("stop_ocr");
+}
+
+export function updateMousePosition(x: number, y: number) {
+  return invoke<void>("update_mouse_position", { x: Math.round(x), y: Math.round(y) });
 }
 
 export async function getOverlayMode(): Promise<OverlayMode> {

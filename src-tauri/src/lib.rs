@@ -25,6 +25,7 @@ struct AppState {
     settings: Mutex<WisSettings>,
     settings_path: PathBuf,
     overlay_mode: Mutex<String>,
+    mouse_position: Mutex<(u32, u32)>,
     capture: Mutex<CaptureRuntime>,
 }
 
@@ -41,6 +42,7 @@ struct CaptureRuntime {
 enum CaptureMode {
     Manual,
     Auto,
+    Mouse,
 }
 
 impl CaptureMode {
@@ -48,7 +50,8 @@ impl CaptureMode {
         match value {
             "manual" => Ok(Self::Manual),
             "auto" => Ok(Self::Auto),
-            _ => Err("capture mode must be manual or auto".to_owned()),
+            "mouse" => Ok(Self::Mouse),
+            _ => Err("capture mode must be manual, auto, or mouse".to_owned()),
         }
     }
 
@@ -56,6 +59,7 @@ impl CaptureMode {
         match self {
             Self::Manual => "manual",
             Self::Auto => "auto",
+            Self::Mouse => "mouse",
         }
     }
 }
@@ -143,6 +147,15 @@ fn save_settings(
     app.emit("settings-changed", &settings)
         .map_err(|error| error.to_string())?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn update_mouse_position(x: u32, y: u32, state: State<'_, AppState>) -> Result<(), String> {
+    *state
+        .mouse_position
+        .lock()
+        .map_err(|_| "mouse position lock was poisoned".to_owned())? = (x, y);
+    Ok(())
 }
 
 #[tauri::command]
@@ -308,7 +321,7 @@ fn run_capture(
     stop: Arc<AtomicBool>,
     mode: CaptureMode,
 ) -> Result<(), String> {
-    let mut tesseract = if mode == CaptureMode::Manual {
+    let mut tesseract = if mode != CaptureMode::Auto {
         let mut engine = LepTess::new(None, "eng")
             .map_err(|error| format!("could not initialize Tesseract English OCR: {error}"))?;
         engine
@@ -384,6 +397,24 @@ fn run_capture(
                 Ok(lines) => (String::new(), 0, None, lines, None),
                 Err(error) => (String::new(), 0, None, Vec::new(), Some(error)),
             },
+            CaptureMode::Mouse => {
+                let position = *app
+                    .state::<AppState>()
+                    .mouse_position
+                    .lock()
+                    .map_err(|_| "mouse position lock was poisoned".to_owned())?;
+                let mouse_region = region_at_mouse(position, logical_size);
+                let (text, confidence, preview, error) = recognize_region(
+                    tesseract
+                        .as_mut()
+                        .expect("mouse capture always initializes Tesseract"),
+                    &frame.vframe,
+                    frame.size,
+                    logical_size,
+                    mouse_region,
+                );
+                (text, confidence, preview, Vec::new(), error)
+            }
         };
         app.emit(
             "ocr-update",
@@ -409,6 +440,29 @@ fn run_capture(
     }
     capture.terminate();
     Ok(())
+}
+
+fn region_at_mouse(position: (u32, u32), logical_size: (u32, u32)) -> Region {
+    const WIDTH: u32 = 240;
+    const HEIGHT: u32 = 120;
+    let width = WIDTH.min(logical_size.0.max(1));
+    let height = HEIGHT.min(logical_size.1.max(1));
+    Region {
+        x: mouse_axis_start(position.0, width, logical_size.0),
+        y: mouse_axis_start(position.1, height, logical_size.1),
+        width,
+        height,
+    }
+}
+
+fn mouse_axis_start(position: u32, size: u32, screen_size: u32) -> u32 {
+    if screen_size <= size {
+        0
+    } else if position.saturating_add(size) <= screen_size {
+        position
+    } else {
+        position.saturating_sub(size)
+    }
 }
 
 fn detect_text_lines(
@@ -567,6 +621,9 @@ fn detect_text_lines(
         if strongest_deviation < 3.5 {
             continue;
         }
+        if has_excessive_local_color(&bgr, rect)? {
+            continue;
+        }
         // Ignore the overlay's stop button in Auto mode.
         if rect.x > frame_width.saturating_sub(80) as i32 && rect.y < 80 {
             continue;
@@ -596,6 +653,55 @@ fn detect_text_lines(
     lines.sort_by_key(|line| (line.y, line.x));
     lines.truncate(256);
     Ok(lines)
+}
+
+fn has_excessive_local_color(bgr: &Mat, rect: Rect) -> Result<bool, String> {
+    if rect.width < 3 || rect.height < 3 {
+        return Ok(false);
+    }
+
+    let mut checked_windows = 0_u32;
+    let mut colorful_windows = 0_u32;
+    let sample_step = (rect.width.max(rect.height) / 64).max(2);
+    let mut center_y = 1;
+    while center_y < rect.height - 1 {
+        let mut center_x = 1;
+        while center_x < rect.width - 1 {
+            let mut colors = [0_u16; 9];
+            let mut color_count = 0_usize;
+            for offset_y in -1..=1 {
+                for offset_x in -1..=1 {
+                    let pixel = *bgr
+                        .at_2d::<core::Vec3b>(
+                            rect.y + center_y + offset_y,
+                            rect.x + center_x + offset_x,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    // Quantize to eight levels per channel. This collapses
+                    // antialias shades while preserving genuinely different
+                    // local colors from photos, avatars, and rich icons.
+                    let color = ((pixel[0] as u16 >> 5) << 6)
+                        | ((pixel[1] as u16 >> 5) << 3)
+                        | (pixel[2] as u16 >> 5);
+                    if !colors[..color_count].contains(&color) {
+                        colors[color_count] = color;
+                        color_count += 1;
+                    }
+                }
+            }
+            checked_windows += 1;
+            if color_count >= 6 {
+                colorful_windows += 1;
+            }
+            center_x += sample_step;
+        }
+        center_y += sample_step;
+    }
+
+    // Require several samples so tiny glyphs are not rejected from one noisy
+    // antialiased corner. Text can tolerate some colorful neighborhoods, but
+    // image-like candidates tend to exceed this ratio consistently.
+    Ok(checked_windows >= 6 && colorful_windows * 100 > checked_windows * 28)
 }
 
 fn recognize_region(
@@ -819,6 +925,7 @@ pub fn run() {
                 settings: Mutex::new(settings),
                 settings_path,
                 overlay_mode: Mutex::new("hidden".to_owned()),
+                mouse_position: Mutex::new((640, 480)),
                 capture: Mutex::new(CaptureRuntime::default()),
             });
             Ok(())
@@ -826,6 +933,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            update_mouse_position,
             get_overlay_mode,
             set_overlay_mode,
             get_runtime_status,

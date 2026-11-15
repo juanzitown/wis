@@ -10,6 +10,7 @@ import {
   RuntimeStatus,
   saveSettings,
   stopOcr,
+  updateMousePosition,
   WisSettings,
   fallbackSettings,
 } from "./tauri";
@@ -23,6 +24,8 @@ type DragState = {
 };
 
 const minimumSize = 32;
+const mouseAreaWidth = 240;
+const mouseAreaHeight = 120;
 
 export default function Overlay() {
   const [settings, setSettings] = useState(fallbackSettings);
@@ -31,8 +34,14 @@ export default function Overlay() {
   const [finding, setFinding] = useState<OcrUpdate | null>(null);
   const [autoBordersVisible, setAutoBordersVisible] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [mousePosition, setMousePosition] = useState(() => ({
+    x: window.innerWidth / 2,
+    y: window.innerHeight / 2,
+  }));
   const settingsRef = useRef(settings);
   const dragRef = useRef<DragState | null>(null);
+  const lastMouseUpdateRef = useRef(0);
+  const pendingMouseUpdateRef = useRef<number | null>(null);
 
   function updateSettings(next: WisSettings) {
     settingsRef.current = next;
@@ -56,8 +65,19 @@ export default function Overlay() {
       if (event.payload.phase === "starting") {
         setFinding(null);
         setAutoBordersVisible(false);
+        if (event.payload.mode === "mouse") {
+          const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+          setMousePosition(center);
+          updateMousePosition(center.x, center.y).catch(() => undefined);
+        }
       }
-      if (event.payload.phase === "idle") setIsStopping(false);
+      if (event.payload.phase === "idle") {
+        setIsStopping(false);
+        if (pendingMouseUpdateRef.current !== null) {
+          window.clearTimeout(pendingMouseUpdateRef.current);
+          pendingMouseUpdateRef.current = null;
+        }
+      }
     });
     const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
       setFinding(event.payload);
@@ -72,6 +92,9 @@ export default function Overlay() {
       statusSubscription.then((unlisten) => unlisten());
       ocrSubscription.then((unlisten) => unlisten());
       autoVisibilitySubscription.then((unlisten) => unlisten());
+      if (pendingMouseUpdateRef.current !== null) {
+        window.clearTimeout(pendingMouseUpdateRef.current);
+      }
     };
   }, []);
 
@@ -100,6 +123,32 @@ export default function Overlay() {
     updateSettings({ ...settingsRef.current, region });
   }
 
+  function movePointer(event: PointerEvent) {
+    moveDrag(event);
+    if (status?.mode !== "mouse" || status.phase === "idle") return;
+    const next = {
+      x: Math.max(0, Math.min(window.innerWidth, event.clientX)),
+      y: Math.max(0, Math.min(window.innerHeight, event.clientY)),
+    };
+    setMousePosition(next);
+    const now = performance.now();
+    const remaining = 50 - (now - lastMouseUpdateRef.current);
+    if (pendingMouseUpdateRef.current !== null) {
+      window.clearTimeout(pendingMouseUpdateRef.current);
+      pendingMouseUpdateRef.current = null;
+    }
+    if (remaining <= 0) {
+      lastMouseUpdateRef.current = now;
+      updateMousePosition(next.x, next.y).catch(() => undefined);
+    } else {
+      pendingMouseUpdateRef.current = window.setTimeout(() => {
+        pendingMouseUpdateRef.current = null;
+        lastMouseUpdateRef.current = performance.now();
+        updateMousePosition(next.x, next.y).catch(() => undefined);
+      }, remaining);
+    }
+  }
+
   function finishDrag() {
     if (!dragRef.current) return;
     dragRef.current = null;
@@ -116,12 +165,20 @@ export default function Overlay() {
     }
   }
 
-  const region = settings.region;
   const isActive = status?.phase !== "idle" && status !== null;
   const isManualActive = isActive && status?.mode === "manual";
   const isAutoActive = isActive && status?.mode === "auto";
+  const isMouseActive = isActive && status?.mode === "mouse";
+  const mouseRegion: Region = {
+    x: mouseAxisStart(mousePosition.x, mouseAreaWidth, window.innerWidth),
+    y: mouseAxisStart(mousePosition.y, mouseAreaHeight, window.innerHeight),
+    width: Math.min(mouseAreaWidth, window.innerWidth),
+    height: Math.min(mouseAreaHeight, window.innerHeight),
+  };
+  const region = isMouseActive ? mouseRegion : settings.region;
+  const isReadingActive = isManualActive || isMouseActive;
   const controlsBelow = region.y < 44;
-  const controlStyle: CSSProperties = isAutoActive
+  const controlStyle: CSSProperties = isAutoActive || isMouseActive
     ? { right: 18, top: 18 }
     : {
         left: Math.min(Math.max(8, region.x + region.width - 32), Math.max(8, window.innerWidth - 40)),
@@ -143,12 +200,12 @@ export default function Overlay() {
   };
   return (
     <div
-      className={`overlay-surface ${mode === "edit" ? "is-editing" : ""}`}
-      onPointerMove={moveDrag}
+      className={`overlay-surface ${mode === "edit" ? "is-editing" : ""} ${isMouseActive ? "is-mouse" : ""}`}
+      onPointerMove={movePointer}
       onPointerUp={finishDrag}
       onPointerCancel={finishDrag}
     >
-      {!isAutoActive && (
+      {!isAutoActive && !isMouseActive && (
         <div
           className="overlay-region"
           style={{ left: region.x, top: region.y, width: region.width, height: region.height }}
@@ -162,6 +219,14 @@ export default function Overlay() {
               onPointerDown={(event) => startDrag(event, action)}
             />
           ))}
+        </div>
+      )}
+      {isMouseActive && (
+        <div
+          className="mouse-capture-region"
+          style={{ left: region.x, top: region.y, width: region.width, height: region.height }}
+        >
+          <span className="overlay-label">Mouse 240×120</span>
         </div>
       )}
       {isAutoActive && autoBordersVisible && finding?.detectedLines.map((line, index) => (
@@ -184,7 +249,7 @@ export default function Overlay() {
           ×
         </button>
       )}
-      {isManualActive && (
+      {isReadingActive && (
         <div
           aria-live="polite"
           className={`overlay-finding ${finding?.error ? "has-error" : ""}`}
@@ -208,6 +273,12 @@ export default function Overlay() {
       )}
     </div>
   );
+}
+
+function mouseAxisStart(position: number, size: number, screenSize: number): number {
+  if (screenSize <= size) return 0;
+  if (position + size <= screenSize) return position;
+  return Math.max(0, position - size);
 }
 
 function resizeRegion(initial: Region, action: DragAction, deltaX: number, deltaY: number): Region {

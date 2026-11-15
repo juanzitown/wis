@@ -56,7 +56,7 @@ export default function App() {
       ([loadedSettings, loadedStatus]) => {
         setSettings(loadedSettings);
         setStatus(loadedStatus);
-        setMessage("Choose manual OCR or automatic text-line detection.");
+        setMessage("Choose manual, mouse, or automatic text-line detection.");
       },
     );
     const settingsSubscription = listen<WisSettings>("settings-changed", (event) => {
@@ -67,7 +67,7 @@ export default function App() {
       if (event.payload.lastError) setMessage(event.payload.lastError);
     });
     const ocrSubscription = listen<OcrUpdate>("ocr-update", (event) => {
-      if (event.payload.mode === "manual") {
+      if (event.payload.mode !== "auto") {
         setFindings((current) => [event.payload, ...current].slice(0, 12));
       }
     });
@@ -107,7 +107,9 @@ export default function App() {
       setMessage(
         mode === "manual"
           ? "Manual OCR is active. Drag or resize the area on screen."
-          : "Auto detection is scanning the screen for text lines.",
+          : mode === "mouse"
+            ? "Mouse OCR is reading a 240×120 area beside the pointer."
+            : "Auto detection is scanning the screen for text lines.",
       );
     } catch (error) {
       setMessage(String(error));
@@ -132,7 +134,7 @@ export default function App() {
         <div>
           <p className="wordmark">wis <span>/ what i see</span></p>
           <h1>Watch a piece of your screen.</h1>
-          <p className="lede">Read one area manually, or let wis outline every text line it can find.</p>
+          <p className="lede">Read a manual area, follow the mouse, or outline every text line wis can find.</p>
         </div>
         <div className={`runtime-badge ${status?.running ? "is-running" : ""}`}>
           <span />
@@ -160,7 +162,7 @@ export default function App() {
           <div className="interval-row">
             <div>
               <strong>Look every</strong>
-              <small>How often Manual OCR or Auto detection scans</small>
+              <small>How often Manual, Mouse, or Auto mode scans</small>
             </div>
             <div className="interval-input">
               <input
@@ -181,6 +183,7 @@ export default function App() {
 
           <div className="button-row">
             <button className="primary" type="button" disabled={!isIdle} onClick={() => beginWatching("manual")}>Start manual</button>
+            <button className="secondary" type="button" disabled={!isIdle} onClick={() => beginWatching("mouse")}>Start mouse</button>
             <button className="secondary" type="button" disabled={!isIdle} onClick={() => beginWatching("auto")}>Start auto</button>
             <button className="secondary" type="button" disabled={isIdle} onClick={endWatching}>Stop</button>
             <button className="quiet" type="button" disabled={!isIdle} onClick={save}>Save</button>

@@ -1,6 +1,7 @@
 Features
 
 - [x] make the latest findings popup scrollable
+- [x] add Mouse mode with a 240x120 pointer-anchored OCR area, findings, and thumbnail
 - [ ] detect and process complete text lines
   - [x] add Manual and Auto modes while preserving the single draggable Manual area
   - [x] group glyph fragments horizontally without merging neighboring rows
@@ -19,3 +20,4 @@ Improvements
   - [x] smooth small texture noise before edge detection
   - [x] reject sparse-edge and nearly flat-color candidate regions
   - [x] relax Otsu edge strength and density gates for repeated low-contrast badges
+  - [x] reject image-like candidates using quantized 3x3 local color diversity
